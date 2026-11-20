@@ -1,0 +1,5 @@
+<Bindings>
+  <Binding name="WBAHSNIPE_REFRESH" header="WBAHSNIPE" category="ADDONS">wb_AHSnipe_Refresh()</Binding>
+  <Binding name="WBAHSNIPE_BUY" category="ADDONS">wb_AHSnipe_Buy()</Binding>
+  <Binding name="WBAHSNIPE_POST" category="ADDONS">wb_AHSnipe_Post()</Binding>
+</Bindings>

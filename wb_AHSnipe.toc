@@ -1,0 +1,9 @@
+## Interface: 16001
+## Title: wb_AH Snipe
+## Notes: Keybinds to refresh and buy the cheapest listing in the stock auction house, without jamming the AH.
+## IconTexture: 133784
+## Author: Will
+## Version: 1.0
+## SavedVariables: wb_AHSnipeDB, wb_AHSnipeLog
+
+Core.lua
