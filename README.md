@@ -25,6 +25,16 @@ World of Warcraft\_forever_\Interface\AddOns\
 
 Restart the game (new files such as the font are only picked up on a full restart).
 
+### Steam Deck / Linux
+
+From Desktop Mode, in Konsole:
+
+```
+curl -fsSL https://raw.githubusercontent.com/willbraden/wb_AHSnipe/main/tools/install-steamdeck.sh | bash
+```
+
+It finds your `World of Warcraft/_forever_` folder (Steam Proton prefix, SD card, Heroic or Lutris), downloads the latest version and installs it. Run it again to update. If it can't find WoW, pass the folder: `bash install-steamdeck.sh "/path/to/World of Warcraft/_forever_"`.
+
 ## Setup
 
 1. In Keybindings, under **wb_AH Snipe**, bind:
