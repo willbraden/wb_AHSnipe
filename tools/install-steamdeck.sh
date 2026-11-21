@@ -26,31 +26,35 @@ warn() { printf '%s\n' "${yellow}!${rst} $*"; }
 die()  { printf '%s\n' "${red}✘ $*${rst}" >&2; exit 1; }
 
 # --- Find the WoW Forever folder --------------------------------------------
+# Looks for any folder named _forever_ that looks like a WoW install, under
+# your home folder (Steam, Proton prefixes, Heroic, Lutris, Bottles…) and any
+# SD card or extra drive.
+looks_like_wow() {
+  local d="$1"
+  [[ -d "$d/Interface" || -d "$d/WTF" || -d "$d/Data" ]] && return 0
+  compgen -G "$d/*.exe" >/dev/null && return 0
+  return 1
+}
+
 find_wow() {
-  local roots=(
-    "$HOME/.steam/steam/steamapps/compatdata"
-    "$HOME/.local/share/Steam/steamapps/compatdata"
-    "$HOME/.steam"
-    "$HOME/.local/share/Steam"
-    /run/media/*/steamapps/compatdata        # SD card
-    /run/media/*/*/steamapps/compatdata
-    "$HOME/Games"                            # Heroic / Lutris
-    "$HOME/.var/app/com.heroicgameslauncher.hgl"
-    "$HOME/.var/app/net.lutris.Lutris"
-  )
-  local r
+  local roots=("$HOME" /run/media /media /mnt)
+  local r d
   for r in "${roots[@]}"; do
     [[ -d "$r" ]] || continue
-    find "$r" -maxdepth 12 -type d -path "*/World of Warcraft/$FLAVOR" 2>/dev/null
+    while IFS= read -r d; do
+      looks_like_wow "$d" && echo "$d"
+    done < <(find -L "$r" -maxdepth 16 \
+               \( -name dosdevices -o -name .cache -o -name Trash -o -name proc -o -name sys \) -prune \
+               -o -type d -name "$FLAVOR" -print 2>/dev/null)
   done | awk '!seen[$0]++'
 }
 
 WOW="${1:-${WOW_DIR:-}}"
 if [[ -z "$WOW" ]]; then
-  info "Looking for World of Warcraft/$FLAVOR…"
+  info "Looking for your WoW Forever folder ($FLAVOR), this can take a minute…"
   mapfile -t found < <(find_wow)
   case "${#found[@]}" in
-    0) die "Couldn't find a 'World of Warcraft/$FLAVOR' folder. Launch WoW Forever once, or pass the path: bash $0 \"/path/to/World of Warcraft/$FLAVOR\"" ;;
+    0) die "Couldn't find a $FLAVOR folder. Launch WoW Forever once, or pass the path: bash $0 \"/path/to/World of Warcraft/$FLAVOR\"" ;;
     1) WOW="${found[0]}" ;;
     *)
       warn "Found more than one install:"
