@@ -12,7 +12,7 @@ A World of Warcraft: Forever addon for fast auction house sniping with the stock
 - **Favorites mode.** On your favorites list, Snipe opens the best deal (furthest under its max). After 10 presses with nothing under max, it goes back to favorites. A checkbox (or keybind) turns this off so you can camp one item.
 - **Check prices.** With a Cancel button. Opens each favorite one press at a time, reads what's really listed, and suggests a max based on your usual discount from market.
 - **Green prices** in the native AH lists for anything at or under your max, plus `-32%` / `+40%` badges on favorites that moved 25% or more between refreshes and a `no max` tag on favorites without a max.
-- **Its own "AH Snipe" chat tab** with table-style results for buys, failures and price moves. Columns line up exactly with the bundled monospace font (DejaVu Sans Mono); `/snipe tab` sends messages back to your main chat.
+- **Its own "AH Snipe" chat tab** with table-style results for buys, failures and price moves, each showing your max and your win rate for that item. Failures and price rises are grayed out. Columns line up exactly with the bundled monospace font (DejaVu Sans Mono); `/snipe tab` sends messages back to your main chat.
 - **Session log** of every press, search, quote and purchase, plus a saved list of bait listings.
 
 ## Install
@@ -61,6 +61,7 @@ Macros, if you prefer:
 | `/snipe max <gold>` | Max for the open item, or your default if none is open |
 | `/snipe default <gold>` | Default max for items without their own |
 | `/snipe clear` | Remove the open item's max |
+| `/snipe stats` | Win rate, units and average price per item this session (`/snipe stats all` for all-time) |
 | `/snipe status` | Show whether the AH is ready |
 | `/snipe mono` | Turn the monospace chat font on or off |
 | `/snipe tab` | Use the AH Snipe chat tab, or your main chat |

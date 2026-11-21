@@ -65,7 +65,9 @@ local COLS = {          -- w = pixels (any font), ch = characters (mono font)
   { w = 34, ch = 4, right = true },  -- quantity
   { w = 170, ch = 22, trunc = true },-- item (long names are shortened)
   { w = 110, ch = 12, right = true },-- price
-  { w = 0 },                         -- details (last column, no padding)
+  { w = 150, ch = 18 },               -- details ("(was …)", "(… each)", why it failed)
+  { w = 120, ch = 16 },               -- your max
+  { w = 0 },                         -- win rate for this item (last column)
 }
 
 -- Mono mode: count visible characters and pad with spaces. Exact, because
@@ -130,7 +132,7 @@ local function Row(cells)
       if col.ch then
         if col.trunc then text = TruncateChars(text, col.ch) end
         local gap = string.rep(" ", math.max(0, col.ch - Visible(text)))
-        local sep = (i == #COLS - 1) and "   " or " "
+        local sep = (i >= 4) and "   " or " "
         out[#out + 1] = col.right and (gap .. text .. sep) or (text .. gap .. sep)
       else
         out[#out + 1] = text
@@ -144,7 +146,7 @@ local function Row(cells)
     if col.trunc then text = Truncate(text, col.w) end
     if col.w > 0 then
       local gap = col.w - Width(text)
-      if col.right then out[#out + 1] = Pad(gap) .. text .. Pad(i == #COLS - 1 and 24 or 10)
+      if col.right then out[#out + 1] = Pad(gap) .. text .. Pad(i == 4 and 24 or 10)
       else out[#out + 1] = text .. Pad(gap + 10) end
     else
       out[#out + 1] = text
@@ -163,8 +165,92 @@ local function Coins(c)
   return ("%d%s"):format(cv, C)
 end
 
+-- Grey out a cell (link colors, coin letters and all) so it reads as
+-- background. Links stay clickable.
+local GREY = "|cff7f7f7f"
+local function Dim(t)
+  if not t or t == "" then return t end
+  t = t:gsub("|c%x%x%x%x%x%x%x%x", GREY):gsub("|cn[^:]*:", GREY):gsub("|r", "|r" .. GREY)
+  return GREY .. t .. "|r"
+end
+
+-- "max 1s 50c" for the last column (or "no max").
+local function MaxCell(id, dim)
+  local cap = id and wb_AHSnipe_CapOf and wb_AHSnipe_CapOf(id)
+  local t = cap and ("|cffaaaaaamax|r " .. Coins(cap)) or "|cffaaaaaano max|r"
+  return dim and Dim(t) or t
+end
+
+-- Win/loss per item: this session, and all-time in DB.stats.
+local session = {}
+local function Tally(id, won, qty, total)
+  if not id or not DB then return end
+  DB.stats = DB.stats or {}
+  for _, t in ipairs({ session, DB.stats }) do
+    local r = t[id] or { won = 0, lost = 0, units = 0, spent = 0 }
+    t[id] = r
+    if won then
+      r.won = r.won + 1
+      r.units = r.units + (qty or 0)
+      r.spent = r.spent + (total or 0)
+    else
+      r.lost = r.lost + 1
+    end
+  end
+end
+
+-- "60% 3/5" for this session, colored by how often you win.
+local function WinCell(id, dim)
+  local r = id and session[id]
+  if not r or r.won + r.lost == 0 then return "" end
+  local n = r.won + r.lost
+  local pct = math.floor(100 * r.won / n + 0.5)
+  local color = pct >= 60 and "|cff55ff55" or pct >= 30 and "|cffffd100" or "|cffff5555"
+  local t = color .. pct .. "%|r |cffaaaaaa" .. r.won .. "/" .. n .. "|r"
+  return dim and Dim(t) or t
+end
+
+-- /snipe stats: one line per item, best win rate first.
+function wb_AHSnipe_Stats(all)
+  local src = all and (DB.stats or {}) or session
+  local list = {}
+  for id, r in pairs(src) do list[#list + 1] = { id = id, r = r } end
+  if #list == 0 then msg(all and "No buys tracked yet." or "No buys this session yet. /snipe stats all for all-time.") return end
+  table.sort(list, function(a, b)
+    local ra = a.r.won / math.max(1, a.r.won + a.r.lost)
+    local rb = b.r.won / math.max(1, b.r.won + b.r.lost)
+    if ra ~= rb then return ra > rb end
+    return a.r.units > b.r.units
+  end)
+  local function cell(t, n, right)
+    t = tostring(t or "")
+    local gap = string.rep(" ", math.max(0, n - Visible(t)))
+    return right and (gap .. t) or (t .. gap)
+  end
+  msg("|cffffd100" .. (all and "All-time" or "This session") .. "|r")
+  msg(cell("|cffaaaaaaItem|r", 22) .. " " .. cell("|cffaaaaaaWin|r", 5, true) .. "  " .. cell("|cffaaaaaaWon|r", 4, true)
+    .. " " .. cell("|cffaaaaaaLost|r", 4, true) .. "  " .. cell("|cffaaaaaaUnits|r", 6, true)
+    .. "  " .. cell("|cffaaaaaaAvg each|r", 12, true) .. "  " .. cell("|cffaaaaaaYour max|r", 12, true))
+  local W, Ls, U, S = 0, 0, 0, 0
+  for _, e in ipairs(list) do
+    local r, n = e.r, e.r.won + e.r.lost
+    local pct = math.floor(100 * r.won / math.max(1, n) + 0.5)
+    local color = pct >= 60 and "|cff55ff55" or pct >= 30 and "|cffffd100" or "|cffff5555"
+    local avg = r.units > 0 and Coins(r.spent / r.units) or ""
+    local cap = wb_AHSnipe_CapOf and wb_AHSnipe_CapOf(e.id)
+    msg(cell(TruncateChars(ItemText(e.id), 22), 22) .. " " .. cell(color .. pct .. "%|r", 5, true)
+      .. "  " .. cell("|cffffd100" .. r.won .. "|r", 4, true) .. " " .. cell("|cffff5555" .. r.lost .. "|r", 4, true)
+      .. "  " .. cell(r.units, 6, true) .. "  " .. cell(avg, 12, true) .. "  " .. cell(cap and Coins(cap) or "", 12, true))
+    W, Ls, U, S = W + r.won, Ls + r.lost, U + r.units, S + r.spent
+  end
+  local pct = math.floor(100 * W / math.max(1, W + Ls) + 0.5)
+  msg(cell("|cffaaaaaaTotal|r", 22) .. " " .. cell(pct .. "%", 5, true) .. "  " .. cell(W, 4, true) .. " " .. cell(Ls, 4, true)
+    .. "  " .. cell(U, 6, true) .. "  " .. cell(Coins(S), 12, true))
+end
+
 local function Fail(qty, item, why)
-  Row({ "|cffff5555Failed|r", qty and ("|cffff5555" .. qty .. "|r") or "", item and ItemText(item) or "", "", "|cffaaaaaa" .. why .. "|r" })
+  Tally(item, false)
+  Row({ "|cffff5555Failed|r", qty and ("|cffff5555" .. qty .. "|r") or "", item and Dim(ItemText(item)) or "", "", GREY .. why .. "|r", MaxCell(item, true), WinCell(item) })
 end
 
 -- Log ----------------------------------------------------------------------
@@ -250,6 +336,7 @@ end
 local function Cap(itemID)
   return (itemID and DB.caps[itemID]) or DB.default
 end
+wb_AHSnipe_CapOf = Cap
 
 local function Clear()
   pending, warned = false, false
@@ -588,8 +675,9 @@ f:SetScript("OnEvent", function(_, e, arg1, arg2)
     buying = nil
     if b then
       local each = b.total and b.qty > 0 and math.floor(b.total / b.qty + 0.5)
+      Tally(b.item, true, b.qty, b.total)
       Row({ "|cffffd100Bought|r", "|cffffd100" .. b.qty .. "|r", ItemText(b.item), Coins(b.total or 0),
-        each and ("|cffaaaaaa(|r" .. Coins(each) .. " |cffaaaaaaeach)|r") or "" })
+        each and ("|cffaaaaaa(|r" .. Coins(each) .. " |cffaaaaaaeach)|r") or "", MaxCell(b.item), WinCell(b.item) })
     else
       msg("|cffffd100Bought.|r")
     end
@@ -605,7 +693,8 @@ f:SetScript("OnEvent", function(_, e, arg1, arg2)
 
   if e == "AUCTION_HOUSE_PURCHASE_COMPLETED" then
     if bidding then
-      Row({ "|cffffd100Bought|r", "|cffffd1001|r", ItemText(bidding.item), Coins(bidding.price), "" })
+      Tally(bidding.item, true, 1, bidding.price)
+      Row({ "|cffffd100Bought|r", "|cffffd1001|r", ItemText(bidding.item), Coins(bidding.price), "", MaxCell(bidding.item), WinCell(bidding.item) })
       bidding = nil
     end
     return
@@ -654,6 +743,8 @@ SlashCmdList.WBAHSNIPE = function(input)
     elseif val == "off" then wb_AHSnipeLog.off = true msg("Logging off.")
     elseif val == "on" then wb_AHSnipeLog.off = nil msg("Logging on.")
     else msg("Log has " .. #wb_AHSnipeLog.rows .. " entries" .. (wb_AHSnipeLog.off and " (logging is off)" or "") .. ". /reload to save it to disk. /snipe log clear | on | off") end
+  elseif cmd == "stats" then
+    wb_AHSnipe_Stats(val == "all")
   elseif cmd == "tab" then
     DB.ownTab = not (DB.ownTab ~= false)
     wb_AHSnipe_SetupTab()
@@ -1275,7 +1366,12 @@ local function SnapFavorites()
         local name = (wb_AHSnipeLog.names[id]) or C_Item.GetItemNameByID(id) or ("item " .. id)
         local n = math.floor(math.abs(pct) * 100 + 0.5)
         local tag = pct < 0 and ("|cff33ff33-" .. n .. "%|r") or ("|cffff5555+" .. n .. "%|r")
-        Row({ tag, "", ItemText(id), Coins(price), "|cffaaaaaa(was|r " .. Coins(old) .. "|cffaaaaaa)|r" })
+        if pct > 0 then
+          -- Price went up: not actionable, so keep it quiet.
+          Row({ tag, "", Dim(ItemText(id)), Dim(Coins(price)), Dim("(was " .. Coins(old) .. ")"), MaxCell(id, true) })
+        else
+          Row({ tag, "", ItemText(id), Coins(price), "|cffaaaaaa(was|r " .. Coins(old) .. "|cffaaaaaa)|r", MaxCell(id) })
+        end
         L("fav_move", { item = id, old = old, new = price, pct = math.floor(pct * 1000 + 0.5) / 10 })
       else
         favChanges[id] = nil
