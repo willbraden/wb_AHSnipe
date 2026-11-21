@@ -6,13 +6,13 @@ A World of Warcraft: Forever addon for fast auction house sniping with the stock
 
 - **One-button snipe.** Each press does the next step: refresh, quote, confirm, then refresh again after a buy.
 - **Never jams the AH.** It won't send a new request while one is still waiting, so a confirmed purchase can't be knocked out by your next press.
-- **Max price per item**, set in gold, silver and copper boxes with up/down steppers (click = 1, Shift-click = 10). Items without their own max use your default.
+- **Max price per item**, set in AH-style gold, silver and copper boxes (click to select, type, Enter). Items without their own max use your default.
 - **Min qty** for commodities. Skips bait listings smaller than this.
 - **Buy %.** Each commodity buy asks for this share of the cheap units, so another buyer taking a few doesn't sink your whole purchase.
 - **Favorites mode.** On your favorites list, Snipe opens the best deal (furthest under its max). After 10 presses with nothing under max, it goes back to favorites. A checkbox (or keybind) turns this off so you can camp one item.
-- **Check prices.** Opens each favorite one press at a time, reads what's really listed, and suggests a max based on your usual discount from market.
+- **Check prices.** With a Cancel button. Opens each favorite one press at a time, reads what's really listed, and suggests a max based on your usual discount from market.
 - **Green prices** in the native AH lists for anything at or under your max, plus `-32%` / `+40%` badges on favorites that moved 25% or more between refreshes and a `no max` tag on favorites without a max.
-- **Table-style chat results** for buys, failures and price moves, aligned with an invisible spacer. Optional monospace chat font (DejaVu Sans Mono, bundled).
+- **Its own "AH Snipe" chat tab** with table-style results for buys, failures and price moves. Columns line up exactly with the bundled monospace font (DejaVu Sans Mono); `/snipe tab` sends messages back to your main chat.
 - **Session log** of every press, search, quote and purchase, plus a saved list of bait listings.
 
 ## Install
@@ -63,6 +63,7 @@ Macros, if you prefer:
 | `/snipe clear` | Remove the open item's max |
 | `/snipe status` | Show whether the AH is ready |
 | `/snipe mono` | Turn the monospace chat font on or off |
+| `/snipe tab` | Use the AH Snipe chat tab, or your main chat |
 | `/snipe log` | Log size. `clear`, `on`, `off` |
 
 ## Log and CSV export

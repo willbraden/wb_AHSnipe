@@ -35,12 +35,20 @@ local favChanges = {}  -- itemID -> fraction change at the last price move
 local itemStale = false -- single-item list needs a refresh (after a bid)
 local lastSaid = {}     -- itemID -> list time we last printed "over your max" for
 local function SayOnce(id, stamp, text)
-  if lastSaid[id] ~= stamp then lastSaid[id] = stamp; print("|cff33ff99AHSnipe|r " .. text) end
+  if lastSaid[id] ~= stamp then lastSaid[id] = stamp; wb_AHSnipe_Msg(text) end
 end
 local DB
 local settings -- the AH Snipe window (built when the AH opens)
 
-local function msg(t) print("|cff33ff99AHSnipe|r " .. t) end
+local OUT -- chat window the addon writes to (its own "AH Snipe" tab when set up)
+local function msg(t)
+  if OUT and OUT ~= DEFAULT_CHAT_FRAME then
+    OUT:AddMessage(t)
+  else
+    DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99AHSnipe|r " .. t)
+  end
+end
+wb_AHSnipe_Msg = msg
 local function money(c) return GetMoneyString(c, true) end
 local function ItemText(id)
   if not id then return "item" end
@@ -52,20 +60,44 @@ end
 -- measured in the chat font and padded with an invisible texture of the exact
 -- missing width.
 local SPACER = "Interface\\AddOns\\wb_AHSnipe\\spacer"
-local COLS = {          -- width in pixels, and alignment
-  { w = 62 },               -- what happened
-  { w = 34, right = true }, -- quantity
-  { w = 120, trunc = true }, -- item (long names are shortened)
-  { w = 110, right = true }, -- price
-  { w = 0 },                -- details (last column, no padding)
+local COLS = {          -- w = pixels (any font), ch = characters (mono font)
+  { w = 62, ch = 7 },                -- what happened
+  { w = 34, ch = 4, right = true },  -- quantity
+  { w = 170, ch = 22, trunc = true },-- item (long names are shortened)
+  { w = 110, ch = 12, right = true },-- price
+  { w = 0 },                         -- details (last column, no padding)
 }
+
+-- Mono mode: count visible characters and pad with spaces. Exact, because
+-- every character in a monospace font is the same width.
+local function MonoOn() return DB and DB.monoChat ~= false end
+local function Visible(t)
+  t = t:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|cn[^:]*:", ""):gsub("|r", ""):gsub("|H.-|h", ""):gsub("|h", ""):gsub("|T.-|t", "  ")
+  local n = 0
+  for _ in t:gmatch("[%z\1-\127\194-\244][\128-\191]*") do n = n + 1 end
+  return n
+end
+local function TruncateChars(text, max)
+  if Visible(text) <= max then return text end
+  local pre, name, post = text:match("^(.-%[)(.-)(%].*)$")
+  if not name then pre, name, post = "", text, "" end
+  local chars = {}
+  for ch in name:gmatch("[%z\1-\127\194-\244][\128-\191]*") do chars[#chars + 1] = ch end
+  for n = #chars - 1, 1, -1 do
+    local t = pre .. table.concat(chars, "", 1, n) .. "…" .. post
+    if Visible(t) <= max then return t end
+  end
+  return pre .. (chars[1] or "") .. "…" .. post
+end
 local measure
 local function Width(text)
-  if not measure then
-    measure = UIParent:CreateFontString(nil, "OVERLAY")
+  -- Measure inside the chat window itself so its scale matches exactly.
+  local target = OUT or DEFAULT_CHAT_FRAME
+  if not measure or measure:GetParent() ~= target then
+    measure = target:CreateFontString(nil, "OVERLAY")
     measure:Hide()
   end
-  local f, size, flags = DEFAULT_CHAT_FRAME:GetFont()
+  local f, size, flags = target:GetFont()
   measure:SetFont(f, size, flags)
   local plain, icons = text:gsub("|T.-|t", "")
   measure:SetText(plain)
@@ -92,6 +124,21 @@ end
 
 local function Row(cells)
   local out = {}
+  if MonoOn() then
+    for i, col in ipairs(COLS) do
+      local text = tostring(cells[i] or "")
+      if col.ch then
+        if col.trunc then text = TruncateChars(text, col.ch) end
+        local gap = string.rep(" ", math.max(0, col.ch - Visible(text)))
+        local sep = (i == #COLS - 1) and "   " or " "
+        out[#out + 1] = col.right and (gap .. text .. sep) or (text .. gap .. sep)
+      else
+        out[#out + 1] = text
+      end
+    end
+    msg(table.concat(out))
+    return
+  end
   for i, col in ipairs(COLS) do
     local text = tostring(cells[i] or "")
     if col.trunc then text = Truncate(text, col.w) end
@@ -117,7 +164,7 @@ local function Coins(c)
 end
 
 local function Fail(qty, item, why)
-  Row({ "|cffff5555Failed|r", qty or "", item and ItemText(item) or "", "", "|cffaaaaaa" .. why .. "|r" })
+  Row({ "|cffff5555Failed|r", qty and ("|cffff5555" .. qty .. "|r") or "", item and ItemText(item) or "", "", "|cffaaaaaa" .. why .. "|r" })
 end
 
 -- Log ----------------------------------------------------------------------
@@ -360,7 +407,7 @@ local function BuyCommodity()
       return
     end
     L("purchase_timeout", { item = buying.item, qty = buying.qty, age = ms(now - buying.at) })
-    Fail(buying.qty, buying.item, "no answer from the server")
+    Fail(buying.qty, buying.item, "no answer")
     buying = nil
     staleID = itemID
   end
@@ -384,7 +431,7 @@ local function BuyCommodity()
       quote = nil
       staleID = itemID
       wb_AHSnipe_Refresh(true)
-      Fail(lostQty, itemID, "cheap ones sold before you confirmed")
+      Fail(lostQty, itemID, "price moved")
       return
     end
     if GetMoney() < quote.total then msg("Not enough gold.") L("press", { step = "no_gold" }) quote = nil return end
@@ -533,7 +580,7 @@ f:SetScript("OnEvent", function(_, e, arg1, arg2)
     if quote then quote.total = arg2 end -- arg1 unitPrice, arg2 totalPrice
     return
   elseif e == "COMMODITY_PRICE_UNAVAILABLE" then
-    if quote then Fail(quote.qty, quote.itemID, "sold before the quote came back") staleID = quote.itemID end
+    if quote then Fail(quote.qty, quote.itemID, "sold out") staleID = quote.itemID end
     quote = nil
     return
   elseif e == "COMMODITY_PURCHASE_SUCCEEDED" then
@@ -541,24 +588,24 @@ f:SetScript("OnEvent", function(_, e, arg1, arg2)
     buying = nil
     if b then
       local each = b.total and b.qty > 0 and math.floor(b.total / b.qty + 0.5)
-      Row({ "|cff55ff55Bought|r", b.qty, ItemText(b.item), Coins(b.total or 0),
+      Row({ "|cffffd100Bought|r", "|cffffd100" .. b.qty .. "|r", ItemText(b.item), Coins(b.total or 0),
         each and ("|cffaaaaaa(|r" .. Coins(each) .. " |cffaaaaaaeach)|r") or "" })
     else
-      msg("|cff55ff55Bought.|r")
+      msg("|cffffd100Bought.|r")
     end
     staleID = OpenItemID()
     return
   elseif e == "COMMODITY_PURCHASE_FAILED" then
     local b = buying
     buying = nil
-    Fail(b and b.qty, b and b.item, "someone else got them first")
+    Fail(b and b.qty, b and b.item, "beaten to it")
     staleID = OpenItemID()
     return
   end
 
   if e == "AUCTION_HOUSE_PURCHASE_COMPLETED" then
     if bidding then
-      Row({ "|cff55ff55Bought|r", 1, ItemText(bidding.item), Coins(bidding.price), "" })
+      Row({ "|cffffd100Bought|r", "|cffffd1001|r", ItemText(bidding.item), Coins(bidding.price), "" })
       bidding = nil
     end
     return
@@ -607,6 +654,10 @@ SlashCmdList.WBAHSNIPE = function(input)
     elseif val == "off" then wb_AHSnipeLog.off = true msg("Logging off.")
     elseif val == "on" then wb_AHSnipeLog.off = nil msg("Logging on.")
     else msg("Log has " .. #wb_AHSnipeLog.rows .. " entries" .. (wb_AHSnipeLog.off and " (logging is off)" or "") .. ". /reload to save it to disk. /snipe log clear | on | off") end
+  elseif cmd == "tab" then
+    DB.ownTab = not (DB.ownTab ~= false)
+    wb_AHSnipe_SetupTab()
+    msg("Own chat tab " .. (DB.ownTab ~= false and "on." or "off. Messages go to your main chat."))
   elseif cmd == "mono" then
     DB.monoChat = not (DB.monoChat ~= false)
     wb_AHSnipe_ApplyMono()
@@ -696,15 +747,20 @@ local function BigBox(parent, name, width, numeric, height, fontSize)
   if height and height > 28 then
     -- Plain flat box drawn at full size (the stock box art doesn't stretch).
     e = CreateFrame("EditBox", name, parent, "BackdropTemplate")
+    -- Achievement-list look: thin rounded brown border on a dark panel,
+    -- gold border while you're typing in it.
     e:SetBackdrop({
       bgFile = "Interface\\Buttons\\WHITE8X8",
-      edgeFile = "Interface\\Buttons\\WHITE8X8",
-      edgeSize = 2,
+      edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+      edgeSize = 14,
+      insets = { left = 3, right = 3, top = 3, bottom = 3 },
     })
-    e:SetBackdropColor(0, 0, 0, 0.6)
-    e:SetBackdropBorderColor(0.55, 0.5, 0.4, 1)
-    e:SetScript("OnEditFocusGained", function(self) self:SetBackdropBorderColor(1, 0.82, 0, 1) end)
-    e:SetScript("OnEditFocusLost", function(self) self:SetBackdropBorderColor(0.55, 0.5, 0.4, 1) end)
+    e:SetBackdropColor(0.09, 0.07, 0.05, 0.95)
+    local IDLE = { 0.48, 0.36, 0.24, 1 }
+    local ACTIVE = { 1, 0.82, 0, 1 }
+    e:SetBackdropBorderColor(unpack(IDLE))
+    e:SetScript("OnEditFocusGained", function(self) self:SetBackdropBorderColor(unpack(ACTIVE)) end)
+    e:SetScript("OnEditFocusLost", function(self) self:SetBackdropBorderColor(unpack(IDLE)) end)
     e:SetFontObject("ChatFontNormal")
     e:EnableMouse(true)
   else
@@ -713,6 +769,12 @@ local function BigBox(parent, name, width, numeric, height, fontSize)
   end
   e:SetSize(width, height or 28)
   e:SetAutoFocus(false)
+  -- Clicking in selects everything, so typing replaces the old value.
+  -- (Done a frame later, or the click itself puts the cursor back.)
+  e:HookScript("OnEditFocusGained", function(self)
+    C_Timer.After(0, function() if self:HasFocus() then self:HighlightText() end end)
+  end)
+  e:HookScript("OnEditFocusLost", function(self) self:HighlightText(0, 0) end)
   e:SetJustifyH("RIGHT")
   if fontSize then
     local f, _, flags = e:GetFont()
@@ -741,22 +803,42 @@ local function Stepper(parent, e, onStep)
   return up
 end
 
-local function BuildBox()
-  if box or not AuctionHouseFrame then return end
-
-  -- Settings window, to the right of the AH.
-  settings = CreateFrame("Frame", "wb_AHSnipeSettings", AuctionHouseFrame, "BackdropTemplate")
-  settings:SetSize(290, 362)
-  settings:SetPoint("TOPLEFT", AuctionHouseFrame, "TOPRIGHT", 4, -30)
-  settings:SetBackdrop({
+-- A window in the auction house's own style: stone border, gold title bar
+-- and dark inset. Falls back to a plain dark box if the template is missing.
+local function AHFrame(name, parent, titleText)
+  local ok, f = pcall(CreateFrame, "Frame", name, parent, "ButtonFrameTemplate")
+  if ok and f then
+    if ButtonFrameTemplate_HidePortrait then pcall(ButtonFrameTemplate_HidePortrait, f) end
+    if ButtonFrameTemplate_HideButtonBar then pcall(ButtonFrameTemplate_HideButtonBar, f) end
+    if f.CloseButton then f.CloseButton:Hide() end
+    f.titleFS = f.TitleText or (f.TitleContainer and f.TitleContainer.TitleText)
+    if f.titleFS then f.titleFS:SetText(titleText)
+    elseif f.SetTitle then f:SetTitle(titleText) end
+    if not f.titleFS then
+      f.titleFS = { SetText = function(_, t) if f.SetTitle then f:SetTitle(t) end end }
+    end
+    return f
+  end
+  f = CreateFrame("Frame", name, parent, "BackdropTemplate")
+  f:SetBackdrop({
     bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background-Dark",
     edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
     tile = true, tileSize = 16, edgeSize = 14,
     insets = { left = 3, right = 3, top = 3, bottom = 3 },
   })
-  local title = settings:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  title:SetPoint("TOP", 0, -8)
-  title:SetText("AH Snipe")
+  f.titleFS = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  f.titleFS:SetPoint("TOP", 0, -8)
+  f.titleFS:SetText(titleText)
+  return f
+end
+
+local function BuildBox()
+  if box or not AuctionHouseFrame then return end
+
+  -- Settings window, to the right of the AH.
+  settings = AHFrame("wb_AHSnipeSettings", AuctionHouseFrame, "AH Snipe")
+  settings:SetSize(290, 236)
+  settings:SetPoint("TOPLEFT", AuctionHouseFrame, "TOPRIGHT", 4, 0)
 
   local function Row(text, y)
     local fs = settings:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -770,47 +852,43 @@ local function BuildBox()
   label = settings:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
   label:SetPoint("LEFT", maxRow, "RIGHT", 8, 0)
 
-  -- Gold / silver / copper, side by side. Enter in any of them saves all three.
-  local coins = {
-    { key = "g", tex = "Interface\\MoneyFrame\\UI-GoldIcon" },
-    { key = "s", tex = "Interface\\MoneyFrame\\UI-SilverIcon" },
-    { key = "c", tex = "Interface\\MoneyFrame\\UI-CopperIcon" },
-  }
-  local boxes = {}
-  for k, coin in ipairs(coins) do
-    local e = BigBox(settings, "wb_AHSnipeMax" .. coin.key, 50, true, 56, 24)
-    e:SetMaxLetters(coin.key == "g" and 5 or 2)
-    if coin.key == "g" then e:SetTextColor(1, 0.82, 0)
-    elseif coin.key == "s" then e:SetTextColor(0.78, 0.8, 0.85)
-    else e:SetTextColor(0.93, 0.55, 0.3) end
-    e:SetPoint("TOPLEFT", settings, "TOPLEFT", 14 + (k - 1) * 90, -48)
-    local unit = coin.key == "g" and 10000 or coin.key == "s" and 100 or 1
-    local up = Stepper(settings, e, function(n)
-      local cur = (tonumber(box:GetText()) or 0) * 10000 + (tonumber(sBox:GetText()) or 0) * 100 + (tonumber(cBox:GetText()) or 0)
-      local v = math.max(1, cur + n * unit)
-      local g, sv, cv = math.floor(v / 10000), math.floor(v / 100) % 100, v % 100
-      box:SetText(g > 0 and tostring(g) or "")
-      sBox:SetText((g > 0 or sv > 0) and tostring(sv) or "")
-      cBox:SetText(tostring(cv))
-      SaveBox(true)
-    end)
-    local icon = settings:CreateTexture(nil, "OVERLAY")
-    icon:SetSize(14, 14)
-    icon:SetTexture(coin.tex)
-    icon:SetPoint("LEFT", e, "RIGHT", 26, 0)
-    e:SetScript("OnEnterPressed", function(self) SaveBox(); self:ClearFocus() end)
-    e:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-    boxes[k] = e
-  end
-  for k, e in ipairs(boxes) do
-    e:SetScript("OnTabPressed", function() boxes[k % 3 + 1]:SetFocus() end)
-  end
-  box, sBox, cBox = boxes[1], boxes[2], boxes[3]
+  -- Max price, styled like the AH's Sell screen: number on the left, coin
+  -- icon inside on the right. Enter in any box saves; Tab moves between them.
+    local coins = {
+      { key = "g", tex = "Interface\\MoneyFrame\\UI-GoldIcon" },
+      { key = "s", tex = "Interface\\MoneyFrame\\UI-SilverIcon" },
+      { key = "c", tex = "Interface\\MoneyFrame\\UI-CopperIcon" },
+    }
+    local boxes = {}
+    for k, coin in ipairs(coins) do
+      -- Gold can run to 5 digits; silver and copper never pass 2.
+      local w = coin.key == "g" and 96 or 56
+      local x = coin.key == "g" and 16 or coin.key == "s" and 124 or 192
+      local e = BigBox(settings, "wb_AHSnipeMax" .. coin.key, w, true, 36, 18)
+      e:SetMaxLetters(coin.key == "g" and 5 or 2)
+      e:SetJustifyH("LEFT")
+      e:SetTextInsets(8, 24, 0, 0)
+      e:SetPoint("TOPLEFT", settings, "TOPLEFT", x, -48)
+      local icon = e:CreateTexture(nil, "OVERLAY")
+      icon:SetSize(14, 14)
+      icon:SetTexture(coin.tex)
+      icon:SetPoint("RIGHT", e, "RIGHT", -8, 0)
+      e:SetScript("OnEnterPressed", function(self) SaveBox(); self:ClearFocus() end)
+      e:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+      boxes[k] = e
+    end
+    for k, e in ipairs(boxes) do
+      e:SetScript("OnTabPressed", function() boxes[k % 3 + 1]:SetFocus() end)
+    end
+    box, sBox, cBox = boxes[1], boxes[2], boxes[3]
 
   -- Min quantity (commodities)
-  Row("Min qty", -114)
-  local minBox = BigBox(settings, "wb_AHSnipeMinBox", 140, true, 56, 24)
-  minBox:SetPoint("TOPLEFT", settings, "TOPLEFT", 16, -130)
+  Row("Min qty", -96)
+  local minBox = BigBox(settings, "wb_AHSnipeMinBox", 64, true, 36, 18)
+  minBox:SetJustifyH("LEFT")
+  minBox:SetTextInsets(8, 8, 0, 0)
+  minBox:SetMaxLetters(4)
+  minBox:SetPoint("TOPLEFT", settings, "TOPLEFT", 16, -112)
   minBox:SetText(tostring(DB.minQty or MIN_QTY))
   local function SaveMin(self, quiet)
     local n = tonumber(self:GetText())
@@ -822,16 +900,17 @@ local function BuildBox()
     self:ClearFocus()
   end
   minBox:SetScript("OnEnterPressed", SaveMin)
-  Stepper(settings, minBox, function(n)
-    minBox:SetText(tostring(math.max(1, (DB.minQty or MIN_QTY) + n)))
-    SaveMin(minBox, true)
-  end)
   minBox:SetScript("OnEscapePressed", function(self) self:SetText(tostring(DB.minQty or MIN_QTY)); self:ClearFocus() end)
 
   -- Buy %: share of the cheap units each buy asks for
-  Row("Buy %", -196)
-  local pctBox = BigBox(settings, "wb_AHSnipePctBox", 140, true, 56, 24)
-  pctBox:SetPoint("TOPLEFT", settings, "TOPLEFT", 16, -212)
+  -- Same line as Min qty, lined up with the silver box above.
+  local pctLabel = settings:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  pctLabel:SetPoint("TOPLEFT", settings, "TOPLEFT", 124, -96)
+  pctLabel:SetText("Buy %")
+  local pctBox = BigBox(settings, "wb_AHSnipePctBox", 64, true, 36, 18)
+  pctBox:SetJustifyH("LEFT")
+  pctBox:SetTextInsets(8, 8, 0, 0)
+  pctBox:SetPoint("TOPLEFT", settings, "TOPLEFT", 124, -112)
   pctBox:SetMaxLetters(3)
   pctBox:SetText(tostring(DB.buyPct or BUY_PCT))
   local function SavePct(self, quiet)
@@ -844,15 +923,11 @@ local function BuildBox()
     self:ClearFocus()
   end
   pctBox:SetScript("OnEnterPressed", SavePct)
-  Stepper(settings, pctBox, function(n)
-    pctBox:SetText(tostring(math.min(100, math.max(1, (DB.buyPct or BUY_PCT) + n))))
-    SavePct(pctBox, true)
-  end)
   pctBox:SetScript("OnEscapePressed", function(self) self:SetText(tostring(DB.buyPct or BUY_PCT)); self:ClearFocus() end)
 
   local roam = CreateFrame("CheckButton", "wb_AHSnipeRoam", settings, "UICheckButtonTemplate")
   roam:SetSize(28, 28)
-  roam:SetPoint("TOPLEFT", settings, "TOPLEFT", 12, -278)
+  roam:SetPoint("TOPLEFT", settings, "TOPLEFT", 12, -158)
   local roamText = roam:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   roamText:SetPoint("LEFT", roam, "RIGHT", 4, 0)
   roamText:SetText("Jump in and out of favorites")
@@ -870,11 +945,23 @@ local function BuildBox()
   checkBtn:SetScript("OnClick", function() wb_AHSnipe_Check() end)
   settings.checkBtn = checkBtn
 
+  local cancelBtn = CreateFrame("Button", "wb_AHSnipeCancelCheck", settings, "UIPanelButtonTemplate")
+  cancelBtn:SetSize(80, 28)
+  cancelBtn:SetPoint("BOTTOMLEFT", settings, "BOTTOMLEFT", 16, 10)
+  cancelBtn:SetText("Cancel")
+  cancelBtn:SetScript("OnClick", function() wb_AHSnipe_CancelCheck() end)
+  cancelBtn:Hide()
+  settings.cancelBtn = cancelBtn
+
+  minBox:SetTextColor(1, 1, 1)
+  pctBox:SetTextColor(1, 1, 1)
   local t = 0
   box:SetScript("OnUpdate", function(self, el)
     t = t + el
     if t < 0.25 then return end
     t = 0
+    if not minBox:HasFocus() then minBox:SetText(tostring(DB.minQty or MIN_QTY)) end
+    if not pctBox:HasFocus() then pctBox:SetText(tostring(DB.buyPct or BUY_PCT)) end
     if self:HasFocus() or sBox:HasFocus() or cBox:HasFocus() then return end
     local id = OpenItemID()
     local saved = id and DB.caps[id]
@@ -882,8 +969,8 @@ local function BuildBox()
     local v = saved or DB.default
     if v then
       local g, sv, cv = math.floor(v / 10000), math.floor(v / 100) % 100, v % 100
-      self:SetText(g > 0 and tostring(g) or "")
-      sBox:SetText((g > 0 or sv > 0) and tostring(sv) or "")
+      self:SetText(tostring(g))
+      sBox:SetText(tostring(sv))
       cBox:SetText(tostring(cv))
     else
       self:SetText(""); sBox:SetText(""); cBox:SetText("")
@@ -1256,15 +1343,8 @@ end
 local function ShowCheckPanel()
   if not lastCheck then return end
   if not checkPanel then
-    checkPanel = CreateFrame("Frame", "wb_AHSnipeCheckPanel", AuctionHouseFrame, "BackdropTemplate")
-    checkPanel:SetBackdrop({
-      bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background-Dark",
-      edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-      tile = true, tileSize = 16, edgeSize = 14,
-      insets = { left = 3, right = 3, top = 3, bottom = 3 },
-    })
-    checkPanel.title = checkPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    checkPanel.title:SetPoint("TOP", 0, -8)
+    checkPanel = AHFrame("wb_AHSnipeCheckPanel", AuctionHouseFrame, "Price check")
+    checkPanel.title = checkPanel.titleFS
     checkPanel.note = checkPanel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     checkPanel.note:SetPoint("TOP", 0, -26)
     local heads = { { "Item", 12 }, { "Market", 140 }, { "Now", 220 }, { "Suggest", 300 } }
@@ -1329,6 +1409,31 @@ local function ShowCheckPanel()
   checkPanel:Show()
 end
 
+-- While a check runs: Cancel on the left, the progress button narrower on the right.
+local function CheckButtons(running)
+  if not (settings and settings.checkBtn) then return end
+  local b, c = settings.checkBtn, settings.cancelBtn
+  b:ClearAllPoints()
+  if running then
+    c:Show()
+    b:SetSize(170, 28)
+    b:SetPoint("BOTTOMRIGHT", settings, "BOTTOMRIGHT", -16, 10)
+  else
+    c:Hide()
+    b:SetSize(258, 28)
+    b:SetPoint("BOTTOM", settings, "BOTTOM", 0, 10)
+    b:SetText("Check prices")
+  end
+end
+
+function wb_AHSnipe_CancelCheck()
+  if not check then CheckButtons(false) return end
+  L("check_cancel", { at = check.i, of = #check.list })
+  check = nil
+  CheckButtons(false)
+  msg("Price check cancelled.")
+end
+
 local function FinishCheck()
   local ratios = {}
   for _, r in ipairs(check.items) do
@@ -1349,7 +1454,7 @@ local function FinishCheck()
   end
   lastCheck = { items = check.items, ratio = ratio, learned = learned, at = time() }
   check = nil
-  if settings and settings.checkBtn then settings.checkBtn:SetText("Check prices") end
+  CheckButtons(false)
   ShowCheckPanel()
   wb_AHSnipe_Favorites()
 end
@@ -1370,6 +1475,7 @@ function wb_AHSnipe_Check()
     local list = {}
     for _, r in ipairs(res) do if r.itemKey then list[#list + 1] = r end end
     check = { list = list, i = 0, items = {} }
+    CheckButtons(true)
     L("check_start", { count = #list })
   end
 
@@ -1396,7 +1502,7 @@ function wb_AHSnipe_Check()
   end
   L("check_open", { item = check.cur.id, n = check.i, of = #check.list, fromItem = inItem and 1 or 0 })
   if settings and settings.checkBtn then
-    settings.checkBtn:SetText(("Checking %d of %d (keep pressing)"):format(check.i, #check.list))
+    settings.checkBtn:SetText(("Checking %d of %d"):format(check.i, #check.list))
   end
   if not OpenDeal(r) then
     check.items[#check.items + 1] = { id = check.cur.id }
@@ -1461,3 +1567,40 @@ end)
 if FCF_SetChatWindowFontSize then
   hooksecurefunc("FCF_SetChatWindowFontSize", function() C_Timer.After(0, wb_AHSnipe_ApplyMono) end)
 end
+
+
+-- Own chat tab -----------------------------------------------------------------
+-- Messages go to a dedicated "AH Snipe" chat tab (docked with General) that
+-- shows nothing else. /snipe tab switches back to the main chat window.
+
+local TAB_NAME = "AH Snipe"
+
+local function FindTab()
+  for i = 1, (NUM_CHAT_WINDOWS or 10) do
+    local name = GetChatWindowInfo(i)
+    if name == TAB_NAME then return _G["ChatFrame" .. i] end
+  end
+end
+
+function wb_AHSnipe_SetupTab()
+  if not DB or DB.ownTab == false then OUT = DEFAULT_CHAT_FRAME return end
+  local f = FindTab()
+  if not f and FCF_OpenNewWindow then
+    pcall(FCF_OpenNewWindow, TAB_NAME)
+    f = FindTab()
+    if f then
+      -- Nothing but our own messages.
+      if ChatFrame_RemoveAllMessageGroups then ChatFrame_RemoveAllMessageGroups(f) end
+      if ChatFrame_RemoveAllChannels then ChatFrame_RemoveAllChannels(f) end
+    end
+  end
+  OUT = f or DEFAULT_CHAT_FRAME
+  if wb_AHSnipe_ApplyMono then wb_AHSnipe_ApplyMono() end
+end
+
+local tf = CreateFrame("Frame")
+tf:RegisterEvent("PLAYER_ENTERING_WORLD")
+tf:SetScript("OnEvent", function(self)
+  self:UnregisterEvent("PLAYER_ENTERING_WORLD")
+  C_Timer.After(2, wb_AHSnipe_SetupTab) -- after Blizzard restores chat windows
+end)
