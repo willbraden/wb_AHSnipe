@@ -4,6 +4,9 @@
 
 BINDING_HEADER_WBAHSNIPE = "wb_AH Snipe"
 BINDING_NAME_WBAHSNIPE_REFRESH = "Refresh AH"
+BINDING_NAME_WBAHSNIPE_FAVS = "Refresh favorites"
+BINDING_NAME_WBAHSNIPE_CHECK = "Check prices (one favorite per press)"
+BINDING_NAME_WBAHSNIPE_ROAM = "Toggle jumping in and out of favorites"
 BINDING_NAME_WBAHSNIPE_BUY = "Snipe (one button: refresh, quote, buy)"
 
 local MIN_GAP = 0.6      -- seconds between searches
@@ -11,6 +14,7 @@ local STALE_GUARD = 8    -- forget our own pending flag after this long
 local WARN_AFTER = 5     -- warn if the AH hasn't answered in this long
 local QUOTE_TTL = 10     -- seconds a commodity price quote is trusted
 local MIN_QTY = 2        -- commodities: skip unless at least this many are under your max
+local BUY_PCT = 50       -- commodities: ask for this % of the cheap units, leaving room if others buy some
 
 local pending, sentAt, warned = false, 0, false
 local quote -- { itemID, qty, maxTotal, at, total }
@@ -20,31 +24,139 @@ local queuedAt -- when an AH message started waiting its turn; sending another w
 local function Queued() return queuedAt and GetTime() - queuedAt < 3 end
 local buying          -- { at, item, qty } while a confirmed purchase is in flight
 local BUY_TIMEOUT = 4 -- seconds to wait for a purchase result before giving up
+local bidding -- { item, price, at } after a single-item buy
+local jumped, jumpAt, jumpPrice -- item the Snipe key opened from favorites
+local itemResultsAt = 0 -- when the single-item list last arrived
+local OVER_MAX_BACK = 10 -- presses in a row with nothing under max before going back to favorites
+local overCount = 0
+local lastBrowse = "text" -- "fav" when the browse list is showing your favorites
+local FAV_ALERT = 0.25 -- favorites: flag price moves of at least 25% between refreshes
+local favChanges = {}  -- itemID -> fraction change at the last price move
 local itemStale = false -- single-item list needs a refresh (after a bid)
 local lastSaid = {}     -- itemID -> list time we last printed "over your max" for
 local function SayOnce(id, stamp, text)
-  if lastSaid[id] ~= stamp then lastSaid[id] = stamp; msg(text) end
+  if lastSaid[id] ~= stamp then lastSaid[id] = stamp; print("|cff33ff99AHSnipe|r " .. text) end
 end
 local DB
+local settings -- the AH Snipe window (built when the AH opens)
 
 local function msg(t) print("|cff33ff99AHSnipe|r " .. t) end
 local function money(c) return GetMoneyString(c, true) end
+local function ItemText(id)
+  if not id then return "item" end
+  local link = C_Item.GetItemInfo and select(2, C_Item.GetItemInfo(id))
+  return link or C_Item.GetItemNameByID(id) or ("item " .. id)
+end
+-- Table-style chat lines ---------------------------------------------------
+-- Chat uses a proportional font, so spaces can't line columns up. Each cell is
+-- measured in the chat font and padded with an invisible texture of the exact
+-- missing width.
+local SPACER = "Interface\\AddOns\\wb_AHSnipe\\spacer"
+local COLS = {          -- width in pixels, and alignment
+  { w = 62 },               -- what happened
+  { w = 34, right = true }, -- quantity
+  { w = 120, trunc = true }, -- item (long names are shortened)
+  { w = 110, right = true }, -- price
+  { w = 0 },                -- details (last column, no padding)
+}
+local measure
+local function Width(text)
+  if not measure then
+    measure = UIParent:CreateFontString(nil, "OVERLAY")
+    measure:Hide()
+  end
+  local f, size, flags = DEFAULT_CHAT_FRAME:GetFont()
+  measure:SetFont(f, size, flags)
+  local plain, icons = text:gsub("|T.-|t", "")
+  measure:SetText(plain)
+  return measure:GetStringWidth() + icons * (size or 14)
+end
+local function Pad(px)
+  px = math.floor(px + 0.5)
+  if px <= 0 then return "" end
+  return "|T" .. SPACER .. ":1:" .. px .. "|t"
+end
+-- Shorten "[Long Item Name]" (link or plain) until it fits the width.
+local function Truncate(text, w)
+  if Width(text) <= w then return text end
+  local pre, name, post = text:match("^(.-%[)(.-)(%].*)$")
+  if not name then pre, name, post = "", text, "" end
+  local chars = {}
+  for ch in name:gmatch("[%z\1-\127\194-\244][\128-\191]*") do chars[#chars + 1] = ch end
+  for n = #chars - 1, 1, -1 do
+    local t = pre .. table.concat(chars, "", 1, n) .. "…" .. post
+    if Width(t) <= w then return t end
+  end
+  return pre .. (chars[1] or "") .. "…" .. post
+end
+
+local function Row(cells)
+  local out = {}
+  for i, col in ipairs(COLS) do
+    local text = tostring(cells[i] or "")
+    if col.trunc then text = Truncate(text, col.w) end
+    if col.w > 0 then
+      local gap = col.w - Width(text)
+      if col.right then out[#out + 1] = Pad(gap) .. text .. Pad(i == #COLS - 1 and 24 or 10)
+      else out[#out + 1] = text .. Pad(gap + 10) end
+    else
+      out[#out + 1] = text
+    end
+  end
+  msg(table.concat(out))
+end
+
+local function Coins(c)
+  if not c then return "" end
+  c = math.floor(c + 0.5)
+  local g, sv, cv = math.floor(c / 10000), math.floor(c / 100) % 100, c % 100
+  local G, S, C = "|cffffd100g|r", "|cffc7c7cfs|r", "|cffeda55fc|r"
+  if g > 0 then return ("%d%s %02d%s %02d%s"):format(g, G, sv, S, cv, C) end
+  if sv > 0 then return ("%d%s %02d%s"):format(sv, S, cv, C) end
+  return ("%d%s"):format(cv, C)
+end
+
+local function Fail(qty, item, why)
+  Row({ "|cffff5555Failed|r", qty or "", item and ItemText(item) or "", "", "|cffaaaaaa" .. why .. "|r" })
+end
 
 -- Log ----------------------------------------------------------------------
 -- Every press, search, quote and purchase is written to wb_AHSnipeLog
 -- (saved to disk on /reload or logout). /snipe log clear wipes it.
 
-local LOG_MAX = 6000
+local LOG_MAX = 12000
 local clock = GetTimePreciseSec or GetTime
 local confirmAt = 0
+
+-- Rows that repeat on every spammed press. A run of identical ones is folded
+-- into a single row: rep = how many, t/ts = first, tEnd = last.
+local NOISY = { key = true, press = true, refresh_skip = true }
+local foldRows = {} -- signature -> row, since the last non-noisy event
 
 local function L(event, data)
   local log = wb_AHSnipeLog
   if not log or log.off then return end
   local row = data or {}
+  if NOISY[event] then
+    -- key, press and refresh_skip interleave on every press, so fold by
+    -- signature until something meaningful happens in between.
+    local sig = event .. "|" .. tostring(row.step or row.why or row.view) .. "|" .. tostring(row.item)
+    local prev = foldRows[sig]
+    if prev then
+      prev.rep = (prev.rep or 1) + 1
+      prev.tEnd = string.format("%.3f", clock())
+      return
+    end
+  end
   row.t = string.format("%.3f", clock())
+  row.ts = time()
   row.e = event
   log.rows[#log.rows + 1] = row
+  if NOISY[event] then
+    foldRows[event .. "|" .. tostring(row.step or row.why or row.view) .. "|" .. tostring(row.item)] = row
+  else
+    foldRows = {}
+  end
   if #log.rows > LOG_MAX then
     local keep = {}
     for i = #log.rows - LOG_MAX / 2, #log.rows do keep[#keep + 1] = log.rows[i] end
@@ -135,7 +247,14 @@ function wb_AHSnipe_Refresh(fromBuy)
       break
     end
   end
-  if not b then b, view = get(ah, "SearchBar", "SearchButton"), "Browse" end
+  if not b then
+    local fav = get(ah, "SearchBar", "FavoritesSearchButton")
+    if lastBrowse == "fav" and fav then
+      b, view = fav, "Favorites"
+    else
+      b, view = get(ah, "SearchBar", "SearchButton"), "Browse"
+    end
+  end
   if not b then msg("Couldn't find a refresh button.") L("error", { what = "no_refresh_button" }) return end
 
   L("search_sent", { view = view, src = src, sinceLast = ms(now - sentAt), item = OpenItemID() })
@@ -145,6 +264,44 @@ function wb_AHSnipe_Refresh(fromBuy)
 end
 
 -- Buy: single items ------------------------------------------------------
+
+-- Jump to deals from favorites ---------------------------------------------
+
+-- Every favorite at or under its max, best deal (furthest under max) first.
+local function Deals()
+  local res = C_AuctionHouse.GetBrowseResults and C_AuctionHouse.GetBrowseResults()
+  local out = {}
+  for _, r in ipairs(res or {}) do
+    local id = r.itemKey and r.itemKey.itemID
+    local cap = id and Cap(id)
+    if cap and r.minPrice and r.minPrice > 0 and r.minPrice <= cap then
+      out[#out + 1] = { r = r, id = id, price = r.minPrice, cap = cap, score = (cap - r.minPrice) / cap }
+    end
+  end
+  table.sort(out, function(a, b) return a.score > b.score end)
+  return out
+end
+
+local function OpenDeal(r)
+  local ah = AuctionHouseFrame
+  local ok = ah and ah.SelectBrowseResult and pcall(ah.SelectBrowseResult, ah, r)
+  if not ok and AuctionHouseBrowseResultsFrameMixin and AuctionHouseBrowseResultsFrameMixin.OnBrowseResultSelected then
+    ok = pcall(AuctionHouseBrowseResultsFrameMixin.OnBrowseResultSelected, ah and ah.BrowseResultsFrame or {}, r)
+  end
+  return ok
+end
+
+-- Nothing under max on this press. After OVER_MAX_BACK in a row (and only
+-- when you're working from favorites), go back to the favorites list.
+local function OverMax(itemID)
+  overCount = overCount + 1
+  if overCount >= OVER_MAX_BACK and lastBrowse == "fav" and DB.roam ~= false then
+    L("auto_back", { item = itemID, presses = overCount })
+    overCount = 0
+    wb_AHSnipe_Favorites()
+    return true
+  end
+end
 
 local function BuyItem(frame)
   local key = KeyOf(frame)
@@ -166,18 +323,20 @@ local function BuyItem(frame)
     end
   end
   local cap = Cap(key.itemID)
-  if not cap then msg("No max price set. Type a max in the box at the bottom right.") return end
+  if not cap then SayOnce(key.itemID, "nomax", "No max set for " .. ItemText(key.itemID) .. ". Type one in the box at the bottom right.") return end
   if not best or best.buyoutAmount > cap then
+    if OverMax(key.itemID) then return end
     local sent = wb_AHSnipe_Refresh(true)
     L("press", { step = "none_under", item = key.itemID, cap = cap, cheapest = best and best.buyoutAmount, sent = sent and 1 or 0 })
     return
   end
   if GetMoney() < best.buyoutAmount then msg("Not enough gold.") return end
 
+  overCount = 0
   L("bid_sent", { item = key.itemID, price = best.buyoutAmount })
   itemStale = true
   C_AuctionHouse.PlaceBid(best.auctionID, best.buyoutAmount)
-  msg("Buying for " .. money(best.buyoutAmount))
+  bidding = { item = key.itemID, price = best.buyoutAmount, at = GetTime() }
 end
 
 -- Buy: commodities -------------------------------------------------------
@@ -190,7 +349,7 @@ local function BuyCommodity()
   local itemID = OpenItemID()
   if not itemID then msg("No item open.") return end
   local cap = Cap(itemID)
-  if not cap then msg("No max price set. Type a max (per unit) in the box at the bottom right.") return end
+  if not cap then SayOnce(itemID, "nomax", "No max set for " .. ItemText(itemID) .. ". Type one (per unit) in the box at the bottom right.") return end
 
   local now = GetTime()
 
@@ -201,7 +360,7 @@ local function BuyCommodity()
       return
     end
     L("purchase_timeout", { item = buying.item, qty = buying.qty, age = ms(now - buying.at) })
-    msg("No answer on that purchase. Refreshing.")
+    Fail(buying.qty, buying.item, "no answer from the server")
     buying = nil
     staleID = itemID
   end
@@ -220,22 +379,19 @@ local function BuyCommodity()
     end
     if quote.total > quote.maxTotal then
       L("quote_rejected", { item = itemID, qty = quote.qty, total = quote.total, maxTotal = quote.maxTotal, est = quote.est, age = ms(now - quote.at) })
+      local lostQty = quote.qty
       C_AuctionHouse.CancelCommoditiesPurchase()
       quote = nil
       staleID = itemID
-      if wb_AHSnipe_Refresh(true) then
-        msg("Cheap ones were already gone. Cancelled and refreshed the list.")
-      else
-        msg("Cheap ones were already gone. Cancelled. Press again to refresh.")
-      end
+      wb_AHSnipe_Refresh(true)
+      Fail(lostQty, itemID, "cheap ones sold before you confirmed")
       return
     end
     if GetMoney() < quote.total then msg("Not enough gold.") L("press", { step = "no_gold" }) quote = nil return end
     L("confirm_sent", { item = itemID, qty = quote.qty, total = quote.total, quoteAge = ms(now - quote.at), priceAge = ms(now - (quote.priceAt or now)) })
     confirmAt = now
-    buying = { at = now, item = itemID, qty = quote.qty }
+    buying = { at = now, item = itemID, qty = quote.qty, total = quote.total, gold = GetMoney() }
     C_AuctionHouse.ConfirmCommoditiesPurchase(itemID, quote.qty)
-    msg("Buying " .. quote.qty .. " for " .. money(quote.total))
     quote = nil
     return
   end
@@ -251,6 +407,10 @@ local function BuyCommodity()
   -- First press: count everything under the max.
   local qty, total, gold = 0, 0, GetMoney()
   local n = C_AuctionHouse.GetNumCommoditySearchResults(itemID)
+  if n == 0 and GetTime() - sentAt < 2 then
+    L("press", { step = "loading", item = itemID })
+    return
+  end
   for i = 1, n do
     local r = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, i)
     if not r or r.unitPrice > cap then break end
@@ -265,37 +425,75 @@ local function BuyCommodity()
   local listAge = ms(now - (resultsAt[itemID] or now))
 
   if qty == 0 then
+    if OverMax(itemID) then return end
     local r = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, 1)
     local sent = wb_AHSnipe_Refresh(true)
     L("press", { step = "none_under", item = itemID, cap = cap, cheapest = r and r.unitPrice, listings = n, listAge = listAge, sent = sent and 1 or 0 })
-    if r and r.unitPrice then
-      SayOnce(itemID, resultsAt[itemID], "Cheapest is " .. money(r.unitPrice) .. " each, over your max. Watching...")
-    end
     return
   end
 
   local minQty = DB.minQty or MIN_QTY
   if qty < minQty then
+    overCount = 0 -- bait under max: stay parked
     local sent = wb_AHSnipe_Refresh(true)
     L("press", { step = "under_min", item = itemID, qty = qty, min = minQty, listAge = listAge, sent = sent and 1 or 0 })
-    SayOnce(itemID, resultsAt[itemID], "Only " .. qty .. " under your max (min " .. minQty .. "). Watching...")
     return
   end
 
+  -- Ask for only part of the cheap units. If another buyer takes a few
+  -- before you confirm, there are still enough left at the quoted price.
+  local avail = qty
+  local pct = DB.buyPct or BUY_PCT
+  local want = math.max(1, math.ceil(avail * pct / 100))
+  if want < avail then
+    qty, total = 0, 0
+    for i = 1, n do
+      local r = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, i)
+      if not r or r.unitPrice > cap then break end
+      local c = math.min(r.quantity - (r.numOwnerItems or 0), want - qty)
+      if c > 0 then qty, total = qty + c, total + c * r.unitPrice end
+      if qty >= want then break end
+    end
+  end
+
+  overCount = 0
   quote = { itemID = itemID, qty = qty, maxTotal = qty * cap, at = now, est = total }
-  L("quote_start", { item = itemID, qty = qty, est = total, cap = cap, listings = n, listAge = listAge })
+  L("quote_start", { item = itemID, qty = qty, avail = avail, pct = pct, est = total, cap = cap, listings = n, listAge = listAge })
   C_AuctionHouse.StartCommoditiesPurchase(itemID, qty)
-  msg("Found " .. qty .. " at or under " .. money(cap) .. " each (about " .. money(total) .. ").")
 end
 
+local lastPressAt = 0
 function wb_AHSnipe_Buy()
   local ah = AH()
   if not ah then return end
+  local now = GetTime()
+  local view = (ah.ItemBuyFrame and ah.ItemBuyFrame:IsShown() and "item")
+    or (ah.CommoditiesBuyFrame and ah.CommoditiesBuyFrame:IsShown() and "commodity")
+    or (lastBrowse == "fav" and "favorites") or "browse"
+  L("key", { view = view, item = OpenItemID(), gap = ms(now - lastPressAt), jumped = jumped })
+  lastPressAt = now
   if ah.ItemBuyFrame and ah.ItemBuyFrame:IsShown() then
     BuyItem(ah.ItemBuyFrame)
   elseif ah.CommoditiesBuyFrame and ah.CommoditiesBuyFrame:IsShown() then
     BuyCommodity()
   else
+    if lastBrowse == "fav" and DB.roam ~= false then
+      local deals = Deals()
+      if #deals > 0 then
+        if Queued() or buying or pending then L("press", { step = "jump_wait", deals = #deals }) return end
+        local d = deals[1]
+        local list = {}
+        for k = 1, math.min(6, #deals) do list[k] = deals[k].id .. ":" .. deals[k].price .. "/" .. deals[k].cap end
+        jumped, jumpAt, jumpPrice = d.id, GetTime(), d.price
+        if OpenDeal(d.r) then
+          pending, sentAt = true, GetTime()
+          L("jump", { item = d.id, price = d.price, cap = d.cap, deals = #deals, all = table.concat(list, " ") })
+          return
+        end
+        jumped, jumpAt, jumpPrice = nil, nil, nil
+        L("error", { what = "jump_failed", item = d.id })
+      end
+    end
     wb_AHSnipe_Refresh(true)
   end
 end
@@ -317,6 +515,8 @@ for _, e in ipairs({
   "COMMODITY_PRICE_UNAVAILABLE",
   "COMMODITY_PURCHASE_SUCCEEDED",
   "COMMODITY_PURCHASE_FAILED",
+  "AUCTION_HOUSE_PURCHASE_COMPLETED",
+  "UI_ERROR_MESSAGE",
 }) do pcall(f.RegisterEvent, f, e) end
 
 f:SetScript("OnEvent", function(_, e, arg1, arg2)
@@ -333,28 +533,47 @@ f:SetScript("OnEvent", function(_, e, arg1, arg2)
     if quote then quote.total = arg2 end -- arg1 unitPrice, arg2 totalPrice
     return
   elseif e == "COMMODITY_PRICE_UNAVAILABLE" then
-    if quote then msg("Those listings sold or changed. Press again to refresh.") staleID = quote.itemID end
+    if quote then Fail(quote.qty, quote.itemID, "sold before the quote came back") staleID = quote.itemID end
     quote = nil
     return
   elseif e == "COMMODITY_PURCHASE_SUCCEEDED" then
+    local b = buying
     buying = nil
-    msg("|cff55ff55Bought.|r")
+    if b then
+      local each = b.total and b.qty > 0 and math.floor(b.total / b.qty + 0.5)
+      Row({ "|cff55ff55Bought|r", b.qty, ItemText(b.item), Coins(b.total or 0),
+        each and ("|cffaaaaaa(|r" .. Coins(each) .. " |cffaaaaaaeach)|r") or "" })
+    else
+      msg("|cff55ff55Bought.|r")
+    end
     staleID = OpenItemID()
     return
   elseif e == "COMMODITY_PURCHASE_FAILED" then
+    local b = buying
     buying = nil
-    msg("|cffff5555Purchase failed.|r Someone may have beaten you to it. Press again to refresh.")
+    Fail(b and b.qty, b and b.item, "someone else got them first")
     staleID = OpenItemID()
+    return
+  end
+
+  if e == "AUCTION_HOUSE_PURCHASE_COMPLETED" then
+    if bidding then
+      Row({ "|cff55ff55Bought|r", 1, ItemText(bidding.item), Coins(bidding.price), "" })
+      bidding = nil
+    end
+    return
+  elseif e == "UI_ERROR_MESSAGE" then
+    if bidding and GetTime() - bidding.at < 3 then
+      Fail(1, bidding.item, tostring(arg2))
+      bidding = nil
+    end
     return
   end
 
   if e == "COMMODITY_SEARCH_RESULTS_UPDATED" then staleID = nil end
-  if e == "ITEM_SEARCH_RESULTS_UPDATED" then itemStale = false end
+  if e == "ITEM_SEARCH_RESULTS_UPDATED" then itemStale = false; itemResultsAt = GetTime() end
 
-  if e == "AUCTION_HOUSE_CLOSED" then quote, buying, queuedAt = nil, nil, nil end
-  if e == "AUCTION_HOUSE_THROTTLED_MESSAGE_DROPPED" or e == "AUCTION_HOUSE_BROWSE_FAILURE" then
-    msg("Search was dropped by the server. Wait a moment before refreshing.")
-  end
+  if e == "AUCTION_HOUSE_CLOSED" then quote, buying, queuedAt, jumped = nil, nil, nil, nil end
   Clear()
 end)
 
@@ -388,6 +607,10 @@ SlashCmdList.WBAHSNIPE = function(input)
     elseif val == "off" then wb_AHSnipeLog.off = true msg("Logging off.")
     elseif val == "on" then wb_AHSnipeLog.off = nil msg("Logging on.")
     else msg("Log has " .. #wb_AHSnipeLog.rows .. " entries" .. (wb_AHSnipeLog.off and " (logging is off)" or "") .. ". /reload to save it to disk. /snipe log clear | on | off") end
+  elseif cmd == "mono" then
+    DB.monoChat = not (DB.monoChat ~= false)
+    wb_AHSnipe_ApplyMono()
+    msg("Monospace chat " .. (DB.monoChat ~= false and "on." or "off."))
   elseif cmd == "status" then
     msg("AH ready: " .. tostring(C_AuctionHouse.IsThrottledMessageSystemReady()) .. ", waiting on reply: " .. tostring(pending))
   else
@@ -402,6 +625,7 @@ end
 -- (or your default when no item is open). Type a gold amount and press Enter.
 
 local box, label
+local sBox, cBox -- silver and copper boxes (box is gold)
 
 local function GoldText(c)
   if not c then return "" end
@@ -409,218 +633,268 @@ local function GoldText(c)
   return s
 end
 
-local function SaveBox()
+local function SaveBox(quiet)
   local id = OpenItemID()
-  local txt = strtrim(box:GetText() or "")
-  local gold = tonumber(txt)
-  if txt == "" then
-    if id then DB.caps[id] = nil; msg("Cleared the max for this item.") end
-  elseif gold then
-    local c = math.floor(gold * 10000 + 0.5)
-    if id then DB.caps[id] = c else DB.default = c end
-    msg("Max " .. (id and "for this item" or "default") .. ": " .. money(c))
-  else
-    msg("Enter a gold amount, like 1.5 or .01")
+  local g = strtrim(box:GetText() or "")
+  local sv = strtrim(sBox:GetText() or "")
+  local cv = strtrim(cBox:GetText() or "")
+  if g == "" and sv == "" and cv == "" then
+    if id then DB.caps[id] = nil; msg("Cleared the max for this item.")
+    else DB.default = nil; msg("Cleared the default max.") end
+    return
   end
+  local c = (tonumber(g) or 0) * 10000 + (tonumber(sv) or 0) * 100 + (tonumber(cv) or 0)
+  if c <= 0 then msg("Max must be more than 0.") return end
+  if id then DB.caps[id] = c else DB.default = c end
+  if not quiet then msg("Max " .. (id and ("for " .. ItemText(id)) or "default") .. ": " .. money(c)) end
+end
+
+function wb_AHSnipe_ToggleRoam()
+  DB.roam = not (DB.roam ~= false)
+  if settings and settings.roam then settings.roam:SetChecked(DB.roam) end
+  L("roam", { on = DB.roam and 1 or 0 })
+  msg("Jump in and out of favorites: " .. (DB.roam and "|cff55ff55on|r" or "|cffff5555off|r (staying put)"))
+end
+
+function wb_AHSnipe_Favorites()
+  local ah = AH()
+  if not ah then return end
+  -- Show the browse list first if an item is open.
+  for _, name in ipairs({ "CommoditiesBuyFrame", "ItemBuyFrame" }) do
+    local v = ah[name]
+    if v and v:IsShown() and ah.SetDisplayMode and AuctionHouseFrameDisplayMode then
+      ah:SetDisplayMode(AuctionHouseFrameDisplayMode.Buy)
+    end
+  end
+  lastBrowse = "fav"
+  jumped, jumpAt, jumpPrice = nil, nil, nil
+  return wb_AHSnipe_Refresh(true)
+end
+
+local hooked
+local function HookSearchButtons()
+  if hooked or not AuctionHouseFrame then return end
+  local fav = get(AuctionHouseFrame, "SearchBar", "FavoritesSearchButton")
+  local search = get(AuctionHouseFrame, "SearchBar", "SearchButton")
+  if fav then fav:HookScript("OnClick", function() lastBrowse = "fav" end) end
+  for _, name in ipairs({ "CommoditiesBuyFrame", "ItemBuyFrame", "BrowseResultsFrame" }) do
+    local fr = AuctionHouseFrame[name]
+    if fr then
+      fr:HookScript("OnShow", function()
+        overCount = 0
+        L("view", { show = name, item = OpenItemID(), via = (jumped and GetTime() - (jumpAt or 0) < 1) and "jump" or "you", list = lastBrowse })
+        if name == "BrowseResultsFrame" then jumped = nil end
+      end)
+    end
+  end
+  if search then search:HookScript("OnClick", function() lastBrowse = "text" end) end
+  hooked = true
+end
+
+local function BigBox(parent, name, width, numeric, height, fontSize)
+  local e
+  if height and height > 28 then
+    -- Plain flat box drawn at full size (the stock box art doesn't stretch).
+    e = CreateFrame("EditBox", name, parent, "BackdropTemplate")
+    e:SetBackdrop({
+      bgFile = "Interface\\Buttons\\WHITE8X8",
+      edgeFile = "Interface\\Buttons\\WHITE8X8",
+      edgeSize = 2,
+    })
+    e:SetBackdropColor(0, 0, 0, 0.6)
+    e:SetBackdropBorderColor(0.55, 0.5, 0.4, 1)
+    e:SetScript("OnEditFocusGained", function(self) self:SetBackdropBorderColor(1, 0.82, 0, 1) end)
+    e:SetScript("OnEditFocusLost", function(self) self:SetBackdropBorderColor(0.55, 0.5, 0.4, 1) end)
+    e:SetFontObject("ChatFontNormal")
+    e:EnableMouse(true)
+  else
+    e = CreateFrame("EditBox", name, parent, "InputBoxTemplate")
+    e:SetFontObject("ChatFontNormal")
+  end
+  e:SetSize(width, height or 28)
+  e:SetAutoFocus(false)
+  e:SetJustifyH("RIGHT")
+  if fontSize then
+    local f, _, flags = e:GetFont()
+    e:SetFont(f or STANDARD_TEXT_FONT, fontSize, flags or "")
+  end
+  e:SetTextInsets(10, 12, 0, 0)
+  if numeric then e:SetNumeric(true) end
+  return e
+end
+
+-- Up/down arrows to the right of a box. Click = 1, Shift-click = 10.
+local function Stepper(parent, e, onStep)
+  local function Btn(dir)
+    local b = CreateFrame("Button", nil, parent)
+    b:SetSize(22, 22)
+    local base = "Interface\\ChatFrame\\UI-ChatIcon-Scroll" .. (dir > 0 and "Up" or "Down")
+    b:SetNormalTexture(base .. "-Up")
+    b:SetPushedTexture(base .. "-Down")
+    b:SetHighlightTexture("Interface\\Buttons\\UI-Common-MouseHilight", "ADD")
+    b:SetScript("OnClick", function() onStep(dir * (IsShiftKeyDown() and 10 or 1)) end)
+    return b
+  end
+  local up, down = Btn(1), Btn(-1)
+  up:SetPoint("BOTTOMLEFT", e, "RIGHT", 2, 1)
+  down:SetPoint("TOPLEFT", e, "RIGHT", 2, -1)
+  return up
 end
 
 local function BuildBox()
   if box or not AuctionHouseFrame then return end
-  box = CreateFrame("EditBox", "wb_AHSnipeMaxBox", AuctionHouseFrame, "InputBoxTemplate")
-  box:SetSize(70, 20)
-  box:SetPoint("BOTTOMRIGHT", AuctionHouseFrame, "BOTTOMRIGHT", -12, 6)
-  box:SetAutoFocus(false)
-  box:SetJustifyH("RIGHT")
-  box:SetScript("OnEnterPressed", function(self) SaveBox(); self:ClearFocus() end)
-  box:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
 
-  label = box:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  label:SetPoint("RIGHT", box, "LEFT", -8, 0)
+  -- Settings window, to the right of the AH.
+  settings = CreateFrame("Frame", "wb_AHSnipeSettings", AuctionHouseFrame, "BackdropTemplate")
+  settings:SetSize(290, 362)
+  settings:SetPoint("TOPLEFT", AuctionHouseFrame, "TOPRIGHT", 4, -30)
+  settings:SetBackdrop({
+    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background-Dark",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 14,
+    insets = { left = 3, right = 3, top = 3, bottom = 3 },
+  })
+  local title = settings:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  title:SetPoint("TOP", 0, -8)
+  title:SetText("AH Snipe")
 
-  -- Min quantity box (commodities): left of the max label.
-  local minBox = CreateFrame("EditBox", "wb_AHSnipeMinBox", AuctionHouseFrame, "InputBoxTemplate")
-  minBox:SetSize(36, 20)
-  minBox:SetPoint("RIGHT", label, "LEFT", -16, 0)
-  minBox:SetAutoFocus(false)
-  minBox:SetNumeric(true)
-  minBox:SetJustifyH("RIGHT")
+  local function Row(text, y)
+    local fs = settings:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    fs:SetPoint("TOPLEFT", 14, y)
+    fs:SetText(text)
+    return fs
+  end
+
+  -- Max price
+  local maxRow = Row("Max price", -32)
+  label = settings:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  label:SetPoint("LEFT", maxRow, "RIGHT", 8, 0)
+
+  -- Gold / silver / copper, side by side. Enter in any of them saves all three.
+  local coins = {
+    { key = "g", tex = "Interface\\MoneyFrame\\UI-GoldIcon" },
+    { key = "s", tex = "Interface\\MoneyFrame\\UI-SilverIcon" },
+    { key = "c", tex = "Interface\\MoneyFrame\\UI-CopperIcon" },
+  }
+  local boxes = {}
+  for k, coin in ipairs(coins) do
+    local e = BigBox(settings, "wb_AHSnipeMax" .. coin.key, 50, true, 56, 24)
+    e:SetMaxLetters(coin.key == "g" and 5 or 2)
+    if coin.key == "g" then e:SetTextColor(1, 0.82, 0)
+    elseif coin.key == "s" then e:SetTextColor(0.78, 0.8, 0.85)
+    else e:SetTextColor(0.93, 0.55, 0.3) end
+    e:SetPoint("TOPLEFT", settings, "TOPLEFT", 14 + (k - 1) * 90, -48)
+    local unit = coin.key == "g" and 10000 or coin.key == "s" and 100 or 1
+    local up = Stepper(settings, e, function(n)
+      local cur = (tonumber(box:GetText()) or 0) * 10000 + (tonumber(sBox:GetText()) or 0) * 100 + (tonumber(cBox:GetText()) or 0)
+      local v = math.max(1, cur + n * unit)
+      local g, sv, cv = math.floor(v / 10000), math.floor(v / 100) % 100, v % 100
+      box:SetText(g > 0 and tostring(g) or "")
+      sBox:SetText((g > 0 or sv > 0) and tostring(sv) or "")
+      cBox:SetText(tostring(cv))
+      SaveBox(true)
+    end)
+    local icon = settings:CreateTexture(nil, "OVERLAY")
+    icon:SetSize(14, 14)
+    icon:SetTexture(coin.tex)
+    icon:SetPoint("LEFT", e, "RIGHT", 26, 0)
+    e:SetScript("OnEnterPressed", function(self) SaveBox(); self:ClearFocus() end)
+    e:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    boxes[k] = e
+  end
+  for k, e in ipairs(boxes) do
+    e:SetScript("OnTabPressed", function() boxes[k % 3 + 1]:SetFocus() end)
+  end
+  box, sBox, cBox = boxes[1], boxes[2], boxes[3]
+
+  -- Min quantity (commodities)
+  Row("Min qty", -114)
+  local minBox = BigBox(settings, "wb_AHSnipeMinBox", 140, true, 56, 24)
+  minBox:SetPoint("TOPLEFT", settings, "TOPLEFT", 16, -130)
   minBox:SetText(tostring(DB.minQty or MIN_QTY))
-  local function SaveMin(self)
+  local function SaveMin(self, quiet)
     local n = tonumber(self:GetText())
     if n and n >= 1 then
       DB.minQty = n
-      msg("Min to buy (commodities): " .. n)
+      if not quiet then msg("Min to buy (commodities): " .. n) end
     end
     self:SetText(tostring(DB.minQty or MIN_QTY))
     self:ClearFocus()
   end
   minBox:SetScript("OnEnterPressed", SaveMin)
+  Stepper(settings, minBox, function(n)
+    minBox:SetText(tostring(math.max(1, (DB.minQty or MIN_QTY) + n)))
+    SaveMin(minBox, true)
+  end)
   minBox:SetScript("OnEscapePressed", function(self) self:SetText(tostring(DB.minQty or MIN_QTY)); self:ClearFocus() end)
-  local minLabel = minBox:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  minLabel:SetPoint("RIGHT", minBox, "LEFT", -8, 0)
-  minLabel:SetText("Min qty:")
+
+  -- Buy %: share of the cheap units each buy asks for
+  Row("Buy %", -196)
+  local pctBox = BigBox(settings, "wb_AHSnipePctBox", 140, true, 56, 24)
+  pctBox:SetPoint("TOPLEFT", settings, "TOPLEFT", 16, -212)
+  pctBox:SetMaxLetters(3)
+  pctBox:SetText(tostring(DB.buyPct or BUY_PCT))
+  local function SavePct(self, quiet)
+    local n = tonumber(self:GetText())
+    if n and n >= 1 and n <= 100 then
+      DB.buyPct = n
+      if not quiet then msg("Each buy asks for " .. n .. "% of the cheap units.") end
+    end
+    self:SetText(tostring(DB.buyPct or BUY_PCT))
+    self:ClearFocus()
+  end
+  pctBox:SetScript("OnEnterPressed", SavePct)
+  Stepper(settings, pctBox, function(n)
+    pctBox:SetText(tostring(math.min(100, math.max(1, (DB.buyPct or BUY_PCT) + n))))
+    SavePct(pctBox, true)
+  end)
+  pctBox:SetScript("OnEscapePressed", function(self) self:SetText(tostring(DB.buyPct or BUY_PCT)); self:ClearFocus() end)
+
+  local roam = CreateFrame("CheckButton", "wb_AHSnipeRoam", settings, "UICheckButtonTemplate")
+  roam:SetSize(28, 28)
+  roam:SetPoint("TOPLEFT", settings, "TOPLEFT", 12, -278)
+  local roamText = roam:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  roamText:SetPoint("LEFT", roam, "RIGHT", 4, 0)
+  roamText:SetText("Jump in and out of favorites")
+  roam:SetChecked(DB.roam ~= false)
+  roam:SetScript("OnClick", function(self)
+    DB.roam = self:GetChecked() and true or false
+    L("roam", { on = DB.roam and 1 or 0 })
+  end)
+  settings.roam = roam
+
+  local checkBtn = CreateFrame("Button", "wb_AHSnipeCheckButton", settings, "UIPanelButtonTemplate")
+  checkBtn:SetSize(258, 28)
+  checkBtn:SetPoint("BOTTOM", settings, "BOTTOM", 0, 10)
+  checkBtn:SetText("Check prices")
+  checkBtn:SetScript("OnClick", function() wb_AHSnipe_Check() end)
+  settings.checkBtn = checkBtn
 
   local t = 0
   box:SetScript("OnUpdate", function(self, el)
     t = t + el
     if t < 0.25 then return end
     t = 0
-    if self:HasFocus() then return end
+    if self:HasFocus() or sBox:HasFocus() or cBox:HasFocus() then return end
     local id = OpenItemID()
     local saved = id and DB.caps[id]
-    label:SetText(id and (saved and "Max (g), this item:" or "Max (g), default:") or "Default max (g):")
-    self:SetText(GoldText(saved or DB.default))
+    label:SetText(id and (saved and "for this item" or "using default") or "default for all items")
+    local v = saved or DB.default
+    if v then
+      local g, sv, cv = math.floor(v / 10000), math.floor(v / 100) % 100, v % 100
+      self:SetText(g > 0 and tostring(g) or "")
+      sBox:SetText((g > 0 or sv > 0) and tostring(sv) or "")
+      cBox:SetText(tostring(cv))
+    else
+      self:SetText(""); sBox:SetText(""); cBox:SetText("")
+    end
   end)
 end
 
 local ui = CreateFrame("Frame")
 ui:RegisterEvent("AUCTION_HOUSE_SHOW")
-ui:SetScript("OnEvent", BuildBox)
+ui:SetScript("OnEvent", function() BuildBox(); HookSearchButtons() end)
 
--- Quick Post -------------------------------------------------------------
--- A small panel beside the AH: drop an item on the slot, type a price,
--- press Post (or the keybind). Posts 1 at that price for 24 hours and
--- remembers the price for that item.
-
-BINDING_NAME_WBAHSNIPE_POST = "Quick Post 1"
-
-local POST_DURATION = 2 -- 1 = 12h, 2 = 24h, 3 = 48h
-
-local post -- panel
-local postID, postLink
-
-local function FindInBags(id)
-  for bag = 0, 5 do
-    for slot = 1, C_Container.GetContainerNumSlots(bag) do
-      local info = C_Container.GetContainerItemInfo(bag, slot)
-      if info and info.itemID == id and not info.isLocked then
-        local loc = ItemLocation:CreateFromBagAndSlot(bag, slot)
-        if C_AuctionHouse.IsSellItemValid(loc, false) then return loc end
-      end
-    end
-  end
-end
-
-local function SetPostItem(id, link)
-  postID, postLink = id, link
-  DB.postItem = id
-  local icon = id and C_Item.GetItemIconByID(id)
-  post.slot.icon:SetTexture(icon or "Interface\\PaperDoll\\UI-Backpack-EmptySlot")
-  post.name:SetText(link or (id and C_Item.GetItemNameByID(id)) or "|cff888888Drop an item here|r")
-  local p = id and DB.postPrices[id]
-  post.price:SetText(p and GoldText(p) or "")
-end
-
-function wb_AHSnipe_Post()
-  if not AH() or not post then return end
-  if not postID then msg("Drop an item on the Quick Post slot first.") return end
-
-  local gold = tonumber(strtrim(post.price:GetText() or ""))
-  if not gold or gold <= 0 then msg("Type a post price first.") return end
-  local c = math.floor(gold * 10000 + 0.5)
-  DB.postPrices[postID] = c
-  post.price:ClearFocus()
-
-  if Queued() or not C_AuctionHouse.IsThrottledMessageSystemReady() then msg("AH is busy. Try again in a moment.") return end
-
-  local loc = FindInBags(postID)
-  if not loc then msg("None of that item left in your bags.") return end
-
-  local status = C_AuctionHouse.GetItemCommodityStatus(loc)
-  local COMMODITY = (Enum.ItemCommodityStatus and Enum.ItemCommodityStatus.Commodity) or 2
-  local ITEM = (Enum.ItemCommodityStatus and Enum.ItemCommodityStatus.Item) or 1
-
-  if status == COMMODITY then
-    C_AuctionHouse.PostCommodity(loc, POST_DURATION, 1, c)
-  elseif status == ITEM then
-    C_AuctionHouse.PostItem(loc, POST_DURATION, 1, nil, c)
-  else
-    msg("Item info still loading. Press Post again.")
-    return
-  end
-  msg("Posting 1 " .. (postLink or "") .. " for " .. money(c))
-end
-
-local function BuildPost()
-  if post or not AuctionHouseFrame then return end
-  DB.postPrices = DB.postPrices or {}
-
-  post = CreateFrame("Frame", "wb_AHSnipePost", AuctionHouseFrame, "BackdropTemplate")
-  post:SetSize(180, 118)
-  post:SetPoint("TOPLEFT", AuctionHouseFrame, "TOPRIGHT", 4, -30)
-  post:SetBackdrop({
-    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background-Dark",
-    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-    tile = true, tileSize = 16, edgeSize = 14,
-    insets = { left = 3, right = 3, top = 3, bottom = 3 },
-  })
-
-  local title = post:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  title:SetPoint("TOP", 0, -8)
-  title:SetText("Quick Post")
-
-  local slot = CreateFrame("Button", nil, post)
-  slot:SetSize(34, 34)
-  slot:SetPoint("TOPLEFT", 12, -28)
-  slot.icon = slot:CreateTexture(nil, "ARTWORK")
-  slot.icon:SetAllPoints()
-  slot:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
-  slot:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-  local function Drop()
-    local kind, id, link = GetCursorInfo()
-    if kind == "item" then SetPostItem(id, link); ClearCursor() end
-  end
-  slot:SetScript("OnReceiveDrag", Drop)
-  slot:SetScript("OnClick", function(_, btn)
-    if btn == "RightButton" then SetPostItem(nil) else Drop() end
-  end)
-  slot:SetScript("OnEnter", function(self)
-    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-    if postID then GameTooltip:SetItemByID(postID)
-    else GameTooltip:SetText("Drop an item here.\nRight-click to clear.") end
-    GameTooltip:Show()
-  end)
-  slot:SetScript("OnLeave", GameTooltip_Hide)
-  post.slot = slot
-
-  post.name = post:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-  post.name:SetPoint("LEFT", slot, "RIGHT", 6, 0)
-  post.name:SetPoint("RIGHT", post, "RIGHT", -8, 0)
-  post.name:SetJustifyH("LEFT")
-  post.name:SetWordWrap(true)
-
-  local pl = post:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  pl:SetPoint("TOPLEFT", slot, "BOTTOMLEFT", 0, -12)
-  pl:SetText("Price (g):")
-
-  post.price = CreateFrame("EditBox", nil, post, "InputBoxTemplate")
-  post.price:SetSize(70, 20)
-  post.price:SetPoint("LEFT", pl, "RIGHT", 10, 0)
-  post.price:SetAutoFocus(false)
-  post.price:SetJustifyH("RIGHT")
-  post.price:SetScript("OnEnterPressed", function(self)
-    local g = tonumber(strtrim(self:GetText() or ""))
-    if postID and g then DB.postPrices[postID] = math.floor(g * 10000 + 0.5) end
-    self:ClearFocus()
-  end)
-  post.price:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-
-  local btn = CreateFrame("Button", nil, post, "UIPanelButtonTemplate")
-  btn:SetSize(156, 22)
-  btn:SetPoint("BOTTOM", 0, 10)
-  btn:SetText("Post 1")
-  btn:SetScript("OnClick", wb_AHSnipe_Post)
-
-  if DB.postItem then SetPostItem(DB.postItem) else SetPostItem(nil) end
-end
-
-local pf = CreateFrame("Frame")
-pf:RegisterEvent("AUCTION_HOUSE_SHOW")
-pf:RegisterEvent("AUCTION_HOUSE_AUCTION_CREATED")
-pf:SetScript("OnEvent", function(_, e)
-  if e == "AUCTION_HOUSE_SHOW" then BuildPost()
-  elseif e == "AUCTION_HOUSE_AUCTION_CREATED" then msg("|cff55ff55Posted.|r") end
-end)
 
 -- Highlight prices under your max in the native AH lists ----------------
 -- Turns the price text green on any row at or under your max (item max,
@@ -653,7 +927,7 @@ local function RowInfo(row)
   return id, price, mine
 end
 
-local function PaintRow(row)
+local function PaintRow(row, showBadge)
   local id, price, mine = RowInfo(row)
   local cap = id and Cap(id)
   local under = price and cap and not mine and price <= cap
@@ -673,13 +947,37 @@ local function PaintRow(row)
     end
     if row.wbTint then row.wbTint:SetShown(under and true or false) end
   end
+
+  -- Favorites: % badge beside the price for big moves.
+  local pct = showBadge and lastBrowse == "fav" and id and favChanges[id]
+  local noMax = showBadge and lastBrowse == "fav" and id and not Cap(id)
+  if pct or noMax then
+    if not row.wbBadge then row.wbBadge = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall") end
+    local anchor, left
+    for _, fs in ipairs(row.wbMoneyFS) do
+      local l = fs:IsShown() and (fs:GetText() or "") ~= "" and fs:GetLeft()
+      if l and (not left or l < left) then anchor, left = fs, l end
+    end
+    row.wbBadge:ClearAllPoints()
+    if anchor then row.wbBadge:SetPoint("RIGHT", anchor, "LEFT", -8, 0)
+    else row.wbBadge:SetPoint("LEFT", row, "LEFT", 8, 0) end
+    if pct then
+      local n = math.floor(math.abs(pct) * 100 + 0.5)
+      row.wbBadge:SetText(pct < 0 and ("|cff33ff33-" .. n .. "%|r") or ("|cffff5555+" .. n .. "%|r"))
+    else
+      row.wbBadge:SetText("|cff999999no max|r")
+    end
+    row.wbBadge:Show()
+  elseif row.wbBadge then
+    row.wbBadge:Hide()
+  end
 end
 
-local function PaintList(list)
+local function PaintList(list, showBadge)
   local sb = list and list:IsVisible() and list.ScrollBox
   if not sb or not sb.EnumerateFrames then return end
   for _, row in sb:EnumerateFrames() do
-    pcall(PaintRow, row)
+    pcall(PaintRow, row, showBadge)
   end
 end
 
@@ -691,7 +989,7 @@ hl:SetScript("OnUpdate", function(_, el)
   hlT = 0
   local ah = AH()
   if not ah or not DB then return end
-  PaintList(get(ah, "BrowseResultsFrame", "ItemList"))
+  PaintList(get(ah, "BrowseResultsFrame", "ItemList"), true)
   PaintList(get(ah, "ItemBuyFrame", "ItemList"))
   PaintList(get(ah, "CommoditiesBuyFrame", "ItemList"))
 end)
@@ -718,7 +1016,9 @@ for _, e in ipairs({
   "AUCTION_HOUSE_PURCHASE_COMPLETED",
   "AUCTION_HOUSE_AUCTION_CREATED",
   "UI_ERROR_MESSAGE",
+  "PLAYER_MONEY",
 }) do pcall(lg.RegisterEvent, lg, e) end
+local lastMoney = GetMoney and GetMoney() or 0
 
 lg:SetScript("OnEvent", function(_, e, a1, a2)
   if e == "PLAYER_LOGIN" then
@@ -738,14 +1038,70 @@ lg:SetScript("OnEvent", function(_, e, a1, a2)
 
   if e == "COMMODITY_SEARCH_RESULTS_UPDATED" then
     resultsAt[a1] = now
+    -- Bait: cheapest listing is fewer units than your Min qty and well
+    -- under the next real price.
+    local r1 = C_AuctionHouse.GetCommoditySearchResultInfo(a1, 1)
+    local r2 = C_AuctionHouse.GetCommoditySearchResultInfo(a1, 2)
+    if r1 and r2 and (r1.numOwnerItems or 0) == 0 and r1.quantity < (DB.minQty or MIN_QTY)
+       and r1.unitPrice < r2.unitPrice * 0.85 then
+      wb_AHSnipeLog.bait = wb_AHSnipeLog.bait or {}
+      local k = a1 .. ":" .. r1.unitPrice
+      local b = wb_AHSnipeLog.bait[k]
+      local ts = time()
+      if not b then
+        b = { item = a1, price = r1.unitPrice, qty = r1.quantity, first = ts, seen = 0, days = {} }
+        wb_AHSnipeLog.bait[k] = b
+      end
+      b.seen = b.seen + 1
+      b.last = ts
+      b.next = r2.unitPrice
+      b.cap = Cap(a1)
+      b.days[date("%Y-%m-%d")] = true
+      wb_AHSnipeLog.names = wb_AHSnipeLog.names or {}
+      wb_AHSnipeLog.names[a1] = wb_AHSnipeLog.names[a1] or C_Item.GetItemNameByID(a1)
+    end
     local top = {}
     for i = 1, math.min(5, C_AuctionHouse.GetNumCommoditySearchResults(a1) or 0) do
       local r = C_AuctionHouse.GetCommoditySearchResultInfo(a1, i)
       if r then top[#top + 1] = r.unitPrice .. "x" .. r.quantity .. ((r.numOwnerItems or 0) > 0 and "(mine)" or "") end
     end
-    L(short, { item = a1, latency = ms(now - sentAt), top = table.concat(top, " "), cap = Cap(a1) })
-  elseif e == "ITEM_SEARCH_RESULTS_UPDATED" or e == "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED" then
-    L(short, { latency = ms(now - sentAt) })
+    local cap, under, underListings, n = Cap(a1), 0, 0, C_AuctionHouse.GetNumCommoditySearchResults(a1) or 0
+    if cap then
+      for i = 1, n do
+        local r = C_AuctionHouse.GetCommoditySearchResultInfo(a1, i)
+        if not r or r.unitPrice > cap then break end
+        under = under + r.quantity - (r.numOwnerItems or 0)
+        underListings = underListings + 1
+      end
+    end
+    L(short, { item = a1, latency = ms(now - sentAt), top = table.concat(top, " "), cap = cap,
+      listings = n, underQty = under, underListings = underListings, jumped = jumped })
+  elseif e == "ITEM_SEARCH_RESULTS_UPDATED" then
+    local key = a1
+    local id = key and key.itemID
+    local cap, under, cheapest = id and Cap(id), 0, nil
+    for i = 1, (key and C_AuctionHouse.GetNumItemSearchResults(key) or 0) do
+      local r = C_AuctionHouse.GetItemSearchResultInfo(key, i)
+      if r and r.buyoutAmount and not r.containsOwnerItem then
+        if not cheapest or r.buyoutAmount < cheapest then cheapest = r.buyoutAmount end
+        if cap and r.buyoutAmount <= cap then under = under + 1 end
+      end
+    end
+    L(short, { item = id, latency = ms(now - sentAt), cap = cap, cheapest = cheapest, under = under })
+  elseif e == "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED" then
+    local row = { latency = ms(now - sentAt), list = lastBrowse }
+    if lastBrowse == "fav" then
+      local res = C_AuctionHouse.GetBrowseResults and C_AuctionHouse.GetBrowseResults() or {}
+      local deals, noMax = Deals(), 0
+      for _, r in ipairs(res) do
+        local id = r.itemKey and r.itemKey.itemID
+        if id and not Cap(id) then noMax = noMax + 1 end
+      end
+      local list = {}
+      for k = 1, math.min(6, #deals) do list[k] = deals[k].id .. ":" .. deals[k].price .. "/" .. deals[k].cap end
+      row.items, row.deals, row.noMax, row.dealList = #res, #deals, noMax, table.concat(list, " ")
+    end
+    L(short, row)
   elseif e == "COMMODITY_PRICE_UPDATED" then
     if quote then quote.priceAt = now end
     L(short, { unit = a1, total = a2, latency = quote and ms(now - quote.at), qty = quote and quote.qty, maxTotal = quote and quote.maxTotal })
@@ -753,7 +1109,355 @@ lg:SetScript("OnEvent", function(_, e, a1, a2)
     L(short, { latency = ms(now - confirmAt) })
   elseif e == "UI_ERROR_MESSAGE" then
     if AH() then L("ui_error", { msg = tostring(a2) }) end
+  elseif e == "PLAYER_MONEY" then
+    local m = GetMoney()
+    if AH() then L("money", { gold = m, delta = m - lastMoney }) end
+    lastMoney = m
   else
     L(short, { ready = C_AuctionHouse.IsThrottledMessageSystemReady() and 1 or 0 })
   end
 end)
+
+-- Favorites snapshots ----------------------------------------------------
+-- Each time the favorites list loads, save every item's cheapest price and
+-- total quantity with the real time. Only saved when something changed
+-- since the last snapshot. Stored in wb_AHSnipeLog.favs.
+
+local FAV_MAX = 5000
+local lastFavSig
+local prevFav -- itemID -> cheapest price at the previous favorites refresh
+local warnedNoMax = {} -- favorites already flagged for having no max this session
+
+local function SnapFavorites()
+  if lastBrowse ~= "fav" or not wb_AHSnipeLog then return end
+  local results = C_AuctionHouse.GetBrowseResults and C_AuctionHouse.GetBrowseResults()
+  if not results or #results == 0 then return end
+
+  local missing = {}
+  for _, r in ipairs(results) do
+    local id = r.itemKey and r.itemKey.itemID
+    if id and not Cap(id) and not warnedNoMax[id] then
+      warnedNoMax[id] = true
+      missing[#missing + 1] = C_Item.GetItemNameByID(id) or ("item " .. id)
+    end
+  end
+  if #missing > 0 then
+    msg("|cffffcc00No max set:|r " .. table.concat(missing, ", ") .. ". Open each one and type a max to snipe it.")
+  end
+
+  local parts, cur = {}, {}
+  wb_AHSnipeLog.names = wb_AHSnipeLog.names or {}
+  for _, r in ipairs(results) do
+    local id = r.itemKey and r.itemKey.itemID
+    if id and r.minPrice and r.minPrice > 0 and (not cur[id] or r.minPrice < cur[id]) then
+      cur[id] = r.minPrice
+    end
+    if id and r.minPrice then
+      parts[#parts + 1] = id .. ":" .. r.minPrice .. ":" .. (r.totalQuantity or 0)
+      if not wb_AHSnipeLog.names[id] then
+        wb_AHSnipeLog.names[id] = C_Item.GetItemNameByID(id)
+      end
+    end
+  end
+  table.sort(parts)
+  local sig = table.concat(parts, " ")
+  if sig == lastFavSig then return end
+  lastFavSig = sig
+
+  -- Baseline: the previous refresh this session, or the last saved
+  -- snapshot if it's under 10 minutes old (survives a /reload).
+  if not prevFav and wb_AHSnipeLog.favs then
+    local last = wb_AHSnipeLog.favs[#wb_AHSnipeLog.favs]
+    if last and time() - last.at < 600 then
+      prevFav = {}
+      for sid, sprice in last.d:gmatch("(%d+):(%d+):%d+") do
+        local id, price = tonumber(sid), tonumber(sprice)
+        if not prevFav[id] or price < prevFav[id] then prevFav[id] = price end
+      end
+    end
+  end
+
+  local changed = false
+  for id, price in pairs(cur) do
+    local old = prevFav and prevFav[id]
+    if old and old > 0 and price ~= old then
+      local pct = (price - old) / old
+      if math.abs(pct) >= FAV_ALERT then
+        favChanges[id] = pct
+        changed = true
+        local name = (wb_AHSnipeLog.names[id]) or C_Item.GetItemNameByID(id) or ("item " .. id)
+        local n = math.floor(math.abs(pct) * 100 + 0.5)
+        local tag = pct < 0 and ("|cff33ff33-" .. n .. "%|r") or ("|cffff5555+" .. n .. "%|r")
+        Row({ tag, "", ItemText(id), Coins(price), "|cffaaaaaa(was|r " .. Coins(old) .. "|cffaaaaaa)|r" })
+        L("fav_move", { item = id, old = old, new = price, pct = math.floor(pct * 1000 + 0.5) / 10 })
+      else
+        favChanges[id] = nil
+      end
+    end
+  end
+  prevFav = prevFav or {}
+  for id, price in pairs(cur) do prevFav[id] = price end
+
+  local favs = wb_AHSnipeLog.favs or {}
+  wb_AHSnipeLog.favs = favs
+  favs[#favs + 1] = { at = time(), d = sig }
+  if #favs > FAV_MAX then table.remove(favs, 1) end
+end
+
+local fs = CreateFrame("Frame")
+pcall(fs.RegisterEvent, fs, "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+pcall(fs.RegisterEvent, fs, "AUCTION_HOUSE_BROWSE_RESULTS_ADDED")
+fs:SetScript("OnEvent", function() pcall(SnapFavorites) end)
+
+
+-- Check prices -------------------------------------------------------------
+-- Opens each favorite (one per press, so it never floods the AH), reads what
+-- is really listed, and suggests a max. "Market" is the price you'd reach
+-- after buying the cheapest 10% of what's listed (at least 5 units), so a
+-- single cheap bait listing doesn't count. The suggestion is market times
+-- your own usual ratio: the median of (your max / market) across items that
+-- already have a max, or 70% if fewer than 3 do.
+
+local CHECK_TIMEOUT = 3
+local check        -- run in progress
+local lastCheck    -- results of the last finished run
+local checkPanel
+
+local function FloorFromCommodity(id)
+  local tiers, total = {}, 0
+  for i = 1, C_AuctionHouse.GetNumCommoditySearchResults(id) do
+    local r = C_AuctionHouse.GetCommoditySearchResultInfo(id, i)
+    if r then
+      local q = r.quantity - (r.numOwnerItems or 0)
+      if q > 0 then tiers[#tiers + 1] = { p = r.unitPrice, q = q }; total = total + q end
+    end
+  end
+  if total == 0 then return end
+  local target = math.max(5, math.ceil(total * 0.10))
+  local cum = 0
+  for _, t in ipairs(tiers) do
+    cum = cum + t.q
+    if cum >= target then return t.p, tiers[1].p, total end
+  end
+  return tiers[#tiers].p, tiers[1].p, total
+end
+
+local function FloorFromItem(key)
+  local prices = {}
+  for i = 1, C_AuctionHouse.GetNumItemSearchResults(key) do
+    local r = C_AuctionHouse.GetItemSearchResultInfo(key, i)
+    if r and r.buyoutAmount and not r.containsOwnerItem then prices[#prices + 1] = r.buyoutAmount end
+  end
+  if #prices == 0 then return end
+  table.sort(prices)
+  return prices[math.max(1, math.ceil(#prices * 0.25))], prices[1], #prices
+end
+
+local function ShowCheckPanel()
+  if not lastCheck then return end
+  if not checkPanel then
+    checkPanel = CreateFrame("Frame", "wb_AHSnipeCheckPanel", AuctionHouseFrame, "BackdropTemplate")
+    checkPanel:SetBackdrop({
+      bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background-Dark",
+      edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+      tile = true, tileSize = 16, edgeSize = 14,
+      insets = { left = 3, right = 3, top = 3, bottom = 3 },
+    })
+    checkPanel.title = checkPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    checkPanel.title:SetPoint("TOP", 0, -8)
+    checkPanel.note = checkPanel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    checkPanel.note:SetPoint("TOP", 0, -26)
+    local heads = { { "Item", 12 }, { "Market", 140 }, { "Now", 220 }, { "Suggest", 300 } }
+    for _, h in ipairs(heads) do
+      local fs = checkPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+      fs:SetPoint("TOPLEFT", h[2], -46)
+      fs:SetText(h[1])
+    end
+    checkPanel.rows = {}
+    local all = CreateFrame("Button", nil, checkPanel, "UIPanelButtonTemplate")
+    all:SetSize(120, 24); all:SetPoint("BOTTOMLEFT", 12, 10); all:SetText("Apply all")
+    all:SetScript("OnClick", function()
+      local n = 0
+      for _, r in ipairs(lastCheck.items) do
+        if r.suggest then DB.caps[r.id] = r.suggest; n = n + 1 end
+      end
+      msg("Set " .. n .. " max prices from the price check.")
+      ShowCheckPanel()
+    end)
+    local close = CreateFrame("Button", nil, checkPanel, "UIPanelButtonTemplate")
+    close:SetSize(80, 24); close:SetPoint("BOTTOMRIGHT", -12, 10); close:SetText("Close")
+    close:SetScript("OnClick", function() checkPanel:Hide() end)
+  end
+
+  local items = lastCheck.items
+  checkPanel:ClearAllPoints()
+  if settings then checkPanel:SetPoint("TOPLEFT", settings, "BOTTOMLEFT", 0, -6)
+  else checkPanel:SetPoint("TOPLEFT", AuctionHouseFrame, "TOPRIGHT", 4, -30) end
+  checkPanel:SetSize(420, 100 + #items * 20)
+  checkPanel.title:SetText("Price check: " .. #items .. " favorites")
+  checkPanel.note:SetText(("Suggest = %d%% of market (%s)"):format(math.floor(lastCheck.ratio * 100 + 0.5),
+    lastCheck.learned and "your usual ratio" or "default"))
+
+  for i, r in ipairs(items) do
+    local row = checkPanel.rows[i]
+    if not row then
+      row = CreateFrame("Frame", nil, checkPanel)
+      row:SetSize(400, 20)
+      row.name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+      row.name:SetPoint("LEFT", 12, 0); row.name:SetWidth(124); row.name:SetJustifyH("LEFT"); row.name:SetWordWrap(false)
+      row.market = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall"); row.market:SetPoint("LEFT", 140, 0)
+      row.now = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall"); row.now:SetPoint("LEFT", 220, 0)
+      row.suggest = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall"); row.suggest:SetPoint("LEFT", 300, 0)
+      row.apply = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+      row.apply:SetSize(40, 18); row.apply:SetPoint("RIGHT", -4, 0); row.apply:SetText("Set")
+      checkPanel.rows[i] = row
+    end
+    row:SetPoint("TOPLEFT", 0, -60 - (i - 1) * 20)
+    row.name:SetText(ItemText(r.id))
+    row.market:SetText(r.market and money(r.market) or "|cff888888none|r")
+    local cur = DB.caps[r.id]
+    row.now:SetText(cur and money(cur) or "|cff888888none|r")
+    row.suggest:SetText(r.suggest and money(r.suggest) or "")
+    row.apply:SetShown(r.suggest and cur ~= r.suggest or false)
+    row.apply:SetScript("OnClick", function()
+      DB.caps[r.id] = r.suggest
+      ShowCheckPanel()
+    end)
+    row:Show()
+  end
+  for i = #items + 1, #checkPanel.rows do checkPanel.rows[i]:Hide() end
+  checkPanel:Show()
+end
+
+local function FinishCheck()
+  local ratios = {}
+  for _, r in ipairs(check.items) do
+    local cur = DB.caps[r.id]
+    if cur and r.market and r.market > 0 then ratios[#ratios + 1] = cur / r.market end
+  end
+  table.sort(ratios)
+  local ratio, learned = 0.70, false
+  if #ratios >= 3 then
+    ratio = ratios[math.ceil(#ratios / 2)]
+    ratio = math.max(0.5, math.min(0.95, ratio))
+    learned = true
+  end
+  for _, r in ipairs(check.items) do
+    if r.market then r.suggest = math.max(1, math.floor(r.market * ratio)) end
+    L("price_check", { item = r.id, market = r.market, cheapest = r.cheapest, listed = r.listed,
+      now = DB.caps[r.id], suggest = r.suggest, ratio = math.floor(ratio * 100 + 0.5) })
+  end
+  lastCheck = { items = check.items, ratio = ratio, learned = learned, at = time() }
+  check = nil
+  if settings and settings.checkBtn then settings.checkBtn:SetText("Check prices") end
+  ShowCheckPanel()
+  wb_AHSnipe_Favorites()
+end
+
+function wb_AHSnipe_Check()
+  local ah = AH()
+  if not ah then return end
+  local now = GetTime()
+
+  if not check then
+    local onFavs = lastBrowse == "fav" and ah.BrowseResultsFrame and ah.BrowseResultsFrame:IsShown()
+    local res = onFavs and C_AuctionHouse.GetBrowseResults() or {}
+    if #res == 0 then
+      msg("Opening favorites first. Press Check prices again once the list shows.")
+      wb_AHSnipe_Favorites()
+      return
+    end
+    local list = {}
+    for _, r in ipairs(res) do if r.itemKey then list[#list + 1] = r end end
+    check = { list = list, i = 0, items = {} }
+    L("check_start", { count = #list })
+  end
+
+  -- Still waiting for the last item's listings?
+  if check.cur and not check.cur.done and now - check.cur.at < CHECK_TIMEOUT then return end
+  if check.cur and not check.cur.done then
+    check.items[#check.items + 1] = { id = check.cur.id }
+    check.cur.done = true
+  end
+  -- Our own wait flag never outlives the timeout here.
+  if pending and now - sentAt > CHECK_TIMEOUT then pending = false end
+  if Queued() or buying or pending then return end
+
+  check.i = check.i + 1
+  local r = check.list[check.i]
+  if not r then FinishCheck() return end
+  check.cur = { r = r, id = r.itemKey.itemID, key = r.itemKey, at = now }
+  pending, sentAt = true, now
+  -- Opening an item from inside another item's page never sends a search,
+  -- so step back to the list first. The new item page then loads normally.
+  local inItem = (ah.CommoditiesBuyFrame and ah.CommoditiesBuyFrame:IsShown()) or (ah.ItemBuyFrame and ah.ItemBuyFrame:IsShown())
+  if inItem and ah.SetDisplayMode and AuctionHouseFrameDisplayMode then
+    ah:SetDisplayMode(AuctionHouseFrameDisplayMode.Buy)
+  end
+  L("check_open", { item = check.cur.id, n = check.i, of = #check.list, fromItem = inItem and 1 or 0 })
+  if settings and settings.checkBtn then
+    settings.checkBtn:SetText(("Checking %d of %d (keep pressing)"):format(check.i, #check.list))
+  end
+  if not OpenDeal(r) then
+    check.items[#check.items + 1] = { id = check.cur.id }
+    check.cur.done = true
+  end
+end
+
+local cf = CreateFrame("Frame")
+cf:RegisterEvent("COMMODITY_SEARCH_RESULTS_UPDATED")
+cf:RegisterEvent("ITEM_SEARCH_RESULTS_UPDATED")
+cf:SetScript("OnEvent", function(_, e, a1)
+  local cur = check and check.cur
+  if not cur or cur.done then return end
+  local market, cheapest, listed
+  if e == "COMMODITY_SEARCH_RESULTS_UPDATED" and a1 == cur.id then
+    market, cheapest, listed = FloorFromCommodity(cur.id)
+  elseif e == "ITEM_SEARCH_RESULTS_UPDATED" and a1 and a1.itemID == cur.id then
+    market, cheapest, listed = FloorFromItem(a1)
+  else
+    return
+  end
+  if not market then return end -- empty first update; wait for the real list
+  cur.done = true
+  check.items[#check.items + 1] = { id = cur.id, market = market, cheapest = cheapest, listed = listed }
+  if check.i >= #check.list then
+    if settings and settings.checkBtn then settings.checkBtn:SetText("Done: press once more to see results") end
+  end
+end)
+
+
+-- Monospace chat font ---------------------------------------------------------
+-- Puts every chat window in DejaVu Sans Mono (bundled in fonts\mono.ttf) at
+-- its current size, so table lines and everything else line up. /snipe mono
+-- turns it on or off. Default: on.
+
+local MONO = "Interface\\AddOns\\wb_AHSnipe\\fonts\\mono.ttf"
+local origFont = {}
+
+function wb_AHSnipe_ApplyMono()
+  if not DB then return end
+  local on = DB.monoChat ~= false
+  for i = 1, (NUM_CHAT_WINDOWS or 10) do
+    local cf = _G["ChatFrame" .. i]
+    if cf and cf.GetFont then
+      local f, size, flags = cf:GetFont()
+      if f and f ~= MONO then origFont[i] = { f, flags } end
+      if on then
+        cf:SetFont(MONO, size or 14, flags or "")
+      elseif origFont[i] then
+        cf:SetFont(origFont[i][1], size or 14, origFont[i][2] or "")
+      end
+    end
+  end
+end
+
+local mf = CreateFrame("Frame")
+mf:RegisterEvent("PLAYER_ENTERING_WORLD")
+mf:SetScript("OnEvent", function()
+  -- After Blizzard applies saved chat settings.
+  C_Timer.After(1, wb_AHSnipe_ApplyMono)
+end)
+if FCF_SetChatWindowFontSize then
+  hooksecurefunc("FCF_SetChatWindowFontSize", function() C_Timer.After(0, wb_AHSnipe_ApplyMono) end)
+end

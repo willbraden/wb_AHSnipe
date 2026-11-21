@@ -1,5 +1,7 @@
 <Bindings>
   <Binding name="WBAHSNIPE_REFRESH" header="WBAHSNIPE" category="ADDONS">wb_AHSnipe_Refresh()</Binding>
   <Binding name="WBAHSNIPE_BUY" category="ADDONS">wb_AHSnipe_Buy()</Binding>
-  <Binding name="WBAHSNIPE_POST" category="ADDONS">wb_AHSnipe_Post()</Binding>
+  <Binding name="WBAHSNIPE_FAVS" category="ADDONS">wb_AHSnipe_Favorites()</Binding>
+  <Binding name="WBAHSNIPE_CHECK" category="ADDONS">wb_AHSnipe_Check()</Binding>
+  <Binding name="WBAHSNIPE_ROAM" category="ADDONS">wb_AHSnipe_ToggleRoam()</Binding>
 </Bindings>
