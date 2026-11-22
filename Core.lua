@@ -30,7 +30,9 @@ local bidding -- { item, price, at } after a single-item buy
 local jumped, jumpAt, jumpPrice -- item the Snipe key opened from favorites
 local itemResultsAt = 0 -- when the single-item list last arrived
 local OVER_MAX_BACK = 10 -- presses in a row with nothing under max before going back to favorites
+local EMPTY_JUMP_BACK = 3 -- ...or this many after a jump that found nothing under max, not even bait
 local overCount = 0
+local sawUnder = false   -- this item page has shown units under max (a deal or bait) since you landed
 local lastBrowse = "text" -- "fav" when the browse list is showing your favorites
 local FAV_ALERT = 0.25 -- favorites: flag price moves of at least 25% between refreshes
 local favChanges = {}  -- itemID -> fraction change at the last price move
@@ -560,10 +562,16 @@ end
 
 -- Nothing under max on this press. After OVER_MAX_BACK in a row (and only
 -- when you're working from favorites), go back to the favorites list.
+-- A jump that lands after the cheap units are gone (nothing under max, not
+-- even bait) goes back after EMPTY_JUMP_BACK presses instead of the full count.
+local function BackLimit()
+  return (jumped and not sawUnder) and EMPTY_JUMP_BACK or OVER_MAX_BACK
+end
+
 local function OverMax(itemID)
   overCount = overCount + 1
-  if overCount >= OVER_MAX_BACK and lastBrowse == "fav" and DB.roam ~= false then
-    L("auto_back", { item = itemID, presses = overCount })
+  if overCount >= BackLimit() and lastBrowse == "fav" and DB.roam ~= false then
+    L("auto_back", { item = itemID, presses = overCount, empty = sawUnder and 0 or 1 })
     overCount = 0
     wb_AHSnipe_Favorites()
     return true
@@ -989,6 +997,7 @@ local function HookSearchButtons()
     if fr then
       fr:HookScript("OnShow", function()
         overCount = 0
+        sawUnder = false
         L("view", { show = name, item = OpenItemID(), via = (jumped and GetTime() - (jumpAt or 0) < 1) and "jump" or "you", list = lastBrowse })
         if name == "BrowseResultsFrame" then jumped = nil end
       end)
@@ -1147,7 +1156,7 @@ end
 
 local function BackIn()
   if lastBrowse == "fav" and DB.roam ~= false then
-    return "  Back to favorites in " .. math.max(1, OVER_MAX_BACK - overCount) .. "."
+    return "  Back to favorites in " .. math.max(1, BackLimit() - overCount) .. "."
   end
   return ""
 end
@@ -1912,6 +1921,7 @@ lg:SetScript("OnEvent", function(_, e, a1, a2)
         underListings = underListings + 1
       end
     end
+    if under > 0 and a1 == OpenItemID() then sawUnder = true end
     L(short, { item = a1, latency = ms(now - sentAt), top = table.concat(top, " "), cap = cap,
       listings = n, underQty = under, underListings = underListings, jumped = jumped })
   elseif e == "ITEM_SEARCH_RESULTS_UPDATED" then

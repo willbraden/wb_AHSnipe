@@ -39,7 +39,7 @@ It reads **Max price**, **Min qty** and **Buy %** from the window, feeds **Win t
 ### Refresh and favorites
 - `wb_AHSnipe_Refresh` reruns the current search (item page, favorites or text search). It is gated by rule 1 and by a 0.6s gap for manual presses.
 - `wb_AHSnipe_Favorites` runs the favorites search and sets `lastBrowse = "fav"`. Hooks on the native star and Search buttons keep `lastBrowse` correct.
-- **Jump in and out of favorites** (`DB.roam`): with it on, Snipe opens green favorites, and after 10 presses in a row with nothing under max (`OverMax`) you go back to favorites. Bait (cheap units below Min qty) resets that count, because the user likes staying parked on bait.
+- **Jump in and out of favorites** (`DB.roam`): with it on, Snipe opens green favorites, and after 10 presses in a row with nothing under max (`OverMax`) you go back to favorites. If the page has shown nothing under max at all since the jump (not even bait, tracked by `sawUnder`), it goes back after 3 presses instead (`EMPTY_JUMP_BACK`, via `BackLimit()`). Bait (cheap units below Min qty) resets that count, because the user likes staying parked on bait.
 
 ### The AH Snipe window
 One window to the right of the AH, with four tabs. It follows the AH: the AH's Sell tab switches it to **Sell**, going back switches it to **Snipe**. Setup and Buy % are only opened by a click. `wb_AHSnipe_SelectTab(i)` switches tabs and `wb_AHSnipe_Layout()` sizes the window for the tab.
