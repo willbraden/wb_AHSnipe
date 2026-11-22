@@ -34,7 +34,7 @@ From Desktop Mode, in Konsole:
 curl -fsSL https://raw.githubusercontent.com/willbraden/wb_AHSnipe/main/tools/install-steamdeck.sh | bash
 ```
 
-It finds your `World of Warcraft/_forever_` folder (Steam Proton prefix, SD card, Heroic or Lutris), downloads the latest version and installs it. It remembers the folder and adds an **Update AH Snipe** icon to your desktop: double-click it to update, or right-click it > Add to Steam to update from Game Mode. If it can't find WoW, pass the folder: `bash install-steamdeck.sh "/path/to/World of Warcraft/_forever_"`.
+It finds your `World of Warcraft/_forever_` folder (Steam Proton prefix, SD card, Heroic or Lutris), downloads the latest version and installs it. It remembers the folder and adds an **Update AH Snipe** icon to your desktop: double-click it to update, or right-click it > Add to Steam to update from Game Mode (it runs without a window there). Each update stamps the install time; the AH Snipe chat tab shows "Installed: <time>" at login (or `/snipe version`), and the full output is in `~/.config/wb_AHSnipe/last-update.log`. If it can't find WoW, pass the folder: `bash install-steamdeck.sh "/path/to/World of Warcraft/_forever_"`.
 
 ## Setup
 
@@ -64,6 +64,7 @@ Macros, if you prefer:
 | `/snipe clear` | Remove the open item's max |
 | `/snipe tune` | Open the Buy % tab (`/snipe tune apply` saves each item's best) |
 | `/snipe explore` | Turn Explore Buy % on or off |
+| `/snipe version` | Show when this copy was installed |
 | `/snipe stats` | Win rate, units and average price per item this session (`/snipe stats all` for all-time) |
 | `/snipe status` | Show whether the AH is ready |
 | `/snipe mono` | Turn the monospace chat font on or off |

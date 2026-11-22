@@ -793,6 +793,8 @@ SlashCmdList.WBAHSNIPE = function(input)
     msg("Explore Buy %: " .. (DB.explore and "|cff55ff55on|r" or "|cffff5555off|r"))
   elseif cmd == "stats" then
     wb_AHSnipe_Stats(val == "all")
+  elseif cmd == "version" then
+    msg("|cffaaaaaaInstalled:|r " .. tostring(wb_AHSnipe_Build or "unknown"))
   elseif cmd == "tab" then
     DB.ownTab = not (DB.ownTab ~= false)
     wb_AHSnipe_SetupTab()
@@ -1952,11 +1954,16 @@ function wb_AHSnipe_SetupTab()
   if wb_AHSnipe_ApplyMono then wb_AHSnipe_ApplyMono() end
 end
 
+-- Which install is running (set by the installer; "dev" on the PC copy).
+local function ShowBuild()
+  msg("|cffaaaaaaInstalled:|r " .. tostring(wb_AHSnipe_Build or "unknown"))
+end
+
 local tf = CreateFrame("Frame")
 tf:RegisterEvent("PLAYER_ENTERING_WORLD")
 tf:SetScript("OnEvent", function(self)
   self:UnregisterEvent("PLAYER_ENTERING_WORLD")
-  C_Timer.After(2, wb_AHSnipe_SetupTab) -- after Blizzard restores chat windows
+  C_Timer.After(2, function() wb_AHSnipe_SetupTab(); ShowBuild() end) -- after Blizzard restores chat windows
 end)
 
 

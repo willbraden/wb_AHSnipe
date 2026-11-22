@@ -6,4 +6,5 @@
 ## Version: 1.0
 ## SavedVariables: wb_AHSnipeDB, wb_AHSnipeLog
 
+Build.lua
 Core.lua

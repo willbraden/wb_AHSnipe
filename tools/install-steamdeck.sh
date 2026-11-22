@@ -25,6 +25,13 @@ BRANCH="main"
 NAME="wb_AHSnipe"
 FLAVOR="_forever_"
 
+CONF_DIR="$HOME/.config/wb_AHSnipe"
+mkdir -p "$CONF_DIR"
+# Keep a copy of this run's output (handy when it runs from Game Mode, where
+# there's no window): ~/.config/wb_AHSnipe/last-update.log
+exec > >(tee "$CONF_DIR/last-update.log") 2>&1
+echo "wb_AHSnipe update: $(date '+%Y-%m-%d %H:%M:%S')"
+
 bold=$'\e[1m'; green=$'\e[32m'; yellow=$'\e[33m'; red=$'\e[31m'; rst=$'\e[0m'
 info() { printf '%s\n' "  $*"; }
 ok()   { printf '%s\n' "${green}✔${rst} $*"; }
@@ -55,7 +62,6 @@ find_wow() {
   done | awk '!seen[$0]++'
 }
 
-CONF_DIR="$HOME/.config/wb_AHSnipe"
 SAVED="$CONF_DIR/wow_dir"
 
 WOW="${1:-${WOW_DIR:-}}"
@@ -118,36 +124,55 @@ mkdir -p "$dest"
 cp "$src/$NAME.toc" "$src"/*.lua "$src"/*.xml "$dest"/
 [[ -f "$src/spacer.tga" ]] && cp "$src/spacer.tga" "$dest"/
 [[ -d "$src/fonts" ]] && cp -r "$src/fonts" "$dest"/
+# The addon shows this in its chat tab at login, so you can confirm the update.
+STAMP="$(date '+%Y-%m-%d %H:%M')"
+printf -- '-- Written by the installer.\nwb_AHSnipe_Build = "%s"\n' "$STAMP" > "$dest/Build.lua"
 
 ver="$(grep -m1 '^## Version:' "$dest/$NAME.toc" | cut -d: -f2- | xargs || true)"
-ok "Installed $NAME${ver:+ $ver} to:"
+ok "Installed $NAME${ver:+ $ver} ($STAMP) to:"
 info "$dest"
 echo
 info "${bold}Fully restart WoW${rst} (not just /reload) so it picks up new files."
 info "Your max prices and settings are kept."
+info "In game, the AH Snipe chat tab will say: Installed: $STAMP"
 
 # --- One-click updater icon ------------------------------------------------
-# Always pulls the newest installer, so the icon itself never goes stale.
+# A small launcher that always pulls the newest installer. From Desktop Mode it
+# opens Konsole so you can watch; from Game Mode it runs quietly (Game Mode
+# can't show a terminal). Either way the result is in last-update.log, and the
+# addon shows the install time in its chat tab.
+BIN="$HOME/.local/bin/wb-ahsnipe-update"
+mkdir -p "$(dirname "$BIN")"
+cat > "$BIN" <<LAUNCHER
+#!/usr/bin/env bash
+URL="https://raw.githubusercontent.com/$REPO/$BRANCH/tools/install-steamdeck.sh"
+if [[ "\${1:-}" != "--here" && "\${XDG_CURRENT_DESKTOP:-}" != *gamescope* ]] && command -v konsole >/dev/null; then
+  konsole -e bash -c "'\$0' --here; echo; read -rp 'Press Enter to close.'" && exit 0
+fi
+curl -fsSL "\$URL" -o /tmp/wb-ahsnipe-install.sh && bash /tmp/wb-ahsnipe-install.sh </dev/null
+LAUNCHER
+chmod +x "$BIN"
+
 APP="$HOME/.local/share/applications/wb-ahsnipe-update.desktop"
-if [[ ! -f "$APP" ]]; then
-  mkdir -p "$(dirname "$APP")"
-  cat > "$APP" <<DESKTOP
+first=0; [[ -f "$APP" ]] || first=1
+mkdir -p "$(dirname "$APP")"
+cat > "$APP" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=Update AH Snipe
 Comment=Download and install the latest wb_AHSnipe for WoW Forever
-Exec=bash -c 'curl -fsSL https://raw.githubusercontent.com/$REPO/$BRANCH/tools/install-steamdeck.sh -o /tmp/wb-ahsnipe-install.sh && bash /tmp/wb-ahsnipe-install.sh; echo; read -rp "Press Enter to close."'
+Exec=$BIN
 Icon=system-software-update
-Terminal=true
+Terminal=false
 Categories=Game;
 DESKTOP
-  chmod +x "$APP"
-  if [[ -d "$HOME/Desktop" ]]; then
-    cp "$APP" "$HOME/Desktop/"
-    chmod +x "$HOME/Desktop/wb-ahsnipe-update.desktop"
-    # KDE: mark it trusted so double-click runs it without a prompt
-    command -v gio >/dev/null && gio set "$HOME/Desktop/wb-ahsnipe-update.desktop" metadata::trusted true 2>/dev/null || true
-  fi
+chmod +x "$APP"
+if [[ -d "$HOME/Desktop" ]]; then
+  cp "$APP" "$HOME/Desktop/"
+  chmod +x "$HOME/Desktop/wb-ahsnipe-update.desktop"
+  command -v gio >/dev/null && gio set "$HOME/Desktop/wb-ahsnipe-update.desktop" metadata::trusted true 2>/dev/null || true
+fi
+if [[ $first == 1 ]]; then
   echo
   ok "Added an ${bold}Update AH Snipe${rst} icon to your desktop and app menu."
   info "Next time, just double-click it. To update from Game Mode: right-click it > Add to Steam."
