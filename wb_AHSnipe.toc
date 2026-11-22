@@ -7,4 +7,5 @@
 ## SavedVariables: wb_AHSnipeDB, wb_AHSnipeLog
 
 Build.lua
+Snapshot.lua
 Core.lua

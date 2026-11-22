@@ -415,10 +415,22 @@ end
 -- How many sell per day across the region, from TSM's desktop app data
 -- (AuctionDB "DBRegionSoldPerDay"). nil when TSM or its data isn't there.
 local MIN_SOLD = 200
-local function SoldPerDay(id)
-  if not (id and TSM_API and TSM_API.GetCustomPriceValue) then return end
-  local ok, v = pcall(TSM_API.GetCustomPriceValue, "DBRegionSoldPerDay", "i:" .. id)
+-- Without TSM (the Steam Deck), Snapshot.lua stands in: TSM's sale average
+-- and sold per day, copied from the PC each time the addon is pushed.
+local function Snap(kind, id)
+  local s = wb_AHSnipe_Snapshot
+  local t = type(s) == "table" and s[kind]
+  return t and t[id]
+end
+local function TSMValue(source, id)
+  if not (TSM_API and TSM_API.GetCustomPriceValue) then return end
+  local ok, v = pcall(TSM_API.GetCustomPriceValue, source, "i:" .. id)
   if ok and type(v) == "number" then return v end
+end
+
+local function SoldPerDay(id)
+  if not id then return end
+  return TSMValue("DBRegionSoldPerDay", id) or Snap("sold", id)
 end
 
 -- Snipe skips items that sell fewer than Min sold/day (Setup; 0 = off).
@@ -432,9 +444,9 @@ end
 
 -- What buyers actually paid across the region (TSM "DBRegionSaleAvg", copper).
 local function SoldValue(id)
-  if not (id and TSM_API and TSM_API.GetCustomPriceValue) then return end
-  local ok, v = pcall(TSM_API.GetCustomPriceValue, "DBRegionSaleAvg", "i:" .. id)
-  if ok and type(v) == "number" and v > 0 then return v end
+  if not id then return end
+  local v = TSMValue("DBRegionSaleAvg", id) or Snap("sale", id)
+  if v and v > 0 then return v end
 end
 
 -- Buy ceiling: never pay more than Max % of TSM (Setup; default 90, 0 = off)
@@ -984,6 +996,22 @@ function wb_AHSnipe_Favorites()
   lastBrowse = "fav"
   jumped, jumpAt, jumpPrice = nil, nil, nil
   return wb_AHSnipe_Refresh(true)
+end
+
+-- On a machine without TSM, copy the PC's maxes from Snapshot.lua once per
+-- new snapshot. Maxes you change here afterwards stay until the next one.
+local function ApplySnapshotCaps()
+  local s = wb_AHSnipe_Snapshot
+  if type(s) ~= "table" or type(s.caps) ~= "table" or (TSM_API and TSM_API.GetCustomPriceValue) then return end
+  if DB.snapApplied == s.at then return end
+  local n = 0
+  for id, v in pairs(s.caps) do
+    if DB.caps[id] ~= v then DB.caps[id] = v; n = n + 1 end
+  end
+  if s.default then DB.default = s.default end
+  DB.snapApplied = s.at
+  msg("Copied " .. n .. " max prices from your PC (snapshot " .. date("%b %d %H:%M", s.at) .. ").")
+  L("snapshot_caps", { changed = n, at = s.at })
 end
 
 local hooked
@@ -1603,7 +1631,8 @@ local function UpdateSnipePage()
     else
       local ok = min <= 0 or sold >= min
       card.sold:SetText("|cffaaaaaaSold/day:|r " .. (ok and "|cffffffff" or "|cffff5555") .. tostring(math.floor(sold + 0.5)) .. "|r"
-        .. (min > 0 and (" |cff888888(min " .. min .. ")|r") or "") .. " |cff888888TSM region|r")
+        .. (min > 0 and (" |cff888888(min " .. min .. ")|r") or "")
+        .. ((TSM_API and TSM_API.GetCustomPriceValue) and " |cff888888TSM region|r" or " |cff888888TSM snapshot|r"))
     end
   else
     local lines = favs.lines
@@ -1706,7 +1735,7 @@ local slowSaid
 local function CheckSlowFavorites()
   if lastBrowse ~= "fav" or not DB then return end
   local min = DB.minSold or MIN_SOLD
-  if min <= 0 or not (TSM_API and TSM_API.GetCustomPriceValue) then return end
+  if min <= 0 or not (TSM_API and TSM_API.GetCustomPriceValue or type(wb_AHSnipe_Snapshot) == "table") then return end
   local slow, unknown, sig = {}, {}, { min }
   for _, r in ipairs(C_AuctionHouse.GetBrowseResults() or {}) do
     local id = r.itemKey and r.itemKey.itemID
@@ -1740,7 +1769,7 @@ sfw:SetScript("OnEvent", function() pcall(CheckSlowFavorites) end)
 
 local ui = CreateFrame("Frame")
 ui:RegisterEvent("AUCTION_HOUSE_SHOW")
-ui:SetScript("OnEvent", function() BuildBox(); HookSearchButtons() end)
+ui:SetScript("OnEvent", function() pcall(ApplySnapshotCaps); BuildBox(); HookSearchButtons() end)
 
 
 -- Highlight prices under your max in the native AH lists ----------------

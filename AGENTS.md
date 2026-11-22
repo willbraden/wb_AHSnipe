@@ -10,7 +10,8 @@ The user prefers concise, plain language and no em dashes, in code comments, cha
 |---|---|
 | All addon logic | `Core.lua` (one file, sections marked `-- Name ----`) |
 | Install time stamp | `Build.lua` (`"dev"` in the repo; the Deck installer overwrites it) |
-| Load order and saved data names | `wb_AHSnipe.toc` (`Build.lua`, then `Core.lua`; saves `wb_AHSnipeDB`, `wb_AHSnipeLog`) |
+| Load order and saved data names | `wb_AHSnipe.toc` (`Build.lua`, `Snapshot.lua`, then `Core.lua`; saves `wb_AHSnipeDB`, `wb_AHSnipeLog`) |
+| TSM numbers and maxes for machines without TSM | `Snapshot.lua`, written by `tools/snapshot.py` |
 | Keybinds | `Bindings.xml` |
 | Chat padding texture, chat font | `spacer.tga`, `fonts/mono.ttf` (JetBrains Mono, OFL) |
 | Log to CSV export | `tools/export.py` |
@@ -67,6 +68,9 @@ One click loads favorites if needed, then searches every favorite in turn from a
 
 ### Sold per day (TSM)
 `SoldPerDay(id)` reads TSM's region sold-per-day (`TSM_API.GetCustomPriceValue("DBRegionSoldPerDay", "i:<id>")`, from the TSM desktop app's AppHelper data). `SlowSeller(id)` blocks buying, jumping and the Next press line when it's under **Min sold/day** (`DB.minSold`, default 200, Setup tab; 0 = off). Items TSM has no number for are not blocked, and nothing breaks if TSM isn't installed. The item card shows the number. When the favorites list loads, `CheckSlowFavorites()` prints once which favorites are under Sold/day (skipped) and which have no TSM number; it speaks again only when that list or Sold/day changes.
+
+### TSM snapshot (machines without TSM)
+The Steam Deck has no TSM. `Snapshot.lua` stands in: `wb_AHSnipe_Snapshot` holds TSM's region sale average (`sale`) and sold per day (`sold`) for every item, plus the PC's maxes (`caps`, `default`). `SoldValue()` and `SoldPerDay()` ask TSM first and fall back to the snapshot, so the ceiling, Sold/day and the slow-seller notice work everywhere. On a machine without TSM, `ApplySnapshotCaps()` copies the PC's maxes in once per new snapshot (`DB.snapApplied`); maxes changed there afterwards stay until the next snapshot. The PC never applies it (TSM is loaded). **Before every push, you regenerate it on the PC:** `python3 snapshot.py <AddOns>/TradeSkillMaster_AppHelper/AppData.lua <SavedVariables>/wb_AHSnipe.lua <AddOns>/wb_AHSnipe/Snapshot.lua` (the script lives in the user's AH Tracking folder and in `tools/`), then copy `Snapshot.lua` into the repo. It's a new file in the `.toc`, so the first install needs a full game restart.
 
 ### Realized profit (live ledger + TSM history)
 Snipe keeps its own ledger in `DB.ledger` (started the first time it runs, `start`): every won snipe goes in from `Tally()` via `wb_AHSnipe_LedgerBuy`, and every "Auction successful" mail goes in when the mailbox opens (`ScanMail()` on `MAIL_SHOW` / `MAIL_INBOX_UPDATE`, from `GetInboxInvoiceInfo`: sale minus the AH cut, sent time = now minus (30 minus days left), each mail counted once via `seen`). TSM's saved records (`TradeSkillMasterDB["r@<realm>@internalData@csvSales"]` and `csvBuys`; **sale prices are already after the cut**, per unit) fill in what the ledger can't see: everything before `start`, and AH buys made by hand after it (TSM buys that don't match a ledger snipe by item, qty and 2 minutes). `BuildProfit()` matches sales to buys oldest-first. Units with no AH buy (farmed, crafted) don't count. The Snipe tab's item card and the Sell tab show it per item; `/snipe profit` prints the total, the last 7 days and the top items. `tools/export.py` does the TSM-only version offline (`profit.csv`, `profit_items.csv`, `profit_daily.csv`), so it reflects TSM's last save.
@@ -125,4 +129,4 @@ Everything ──▶ L() log ──▶ export.py CSVs ──▶ analysis skill
 - **You add a window or panel:** you don't. You add it to one of the window's tabs (or a new tab in `BuildBox()`), and size it in `wb_AHSnipe_Layout()`.
 - **You add a log event:** you document it in the analysis skill's event table, and in `export.py` if a CSV should use it.
 - **You add a top-level `local`:** you remember WoW's Lua allows 200 per file. `Core.lua` is close; split into files (and list them in the `.toc`) before adding many more.
-- **You ship it:** you copy the files to the user's `AddOns/wb_AHSnipe` folder (or push to GitHub when they ask), and you tell them whether `/reload` is enough or a full restart is needed (new files such as fonts or textures need a restart).
+- **You ship it:** you copy the files to the user's `AddOns/wb_AHSnipe` folder and stamp `Build.lua` with the time and commit (or push to GitHub when they ask, after regenerating `Snapshot.lua`), and you tell them whether `/reload` is enough or a full restart is needed (new files such as fonts or textures need a restart).
