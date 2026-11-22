@@ -8,6 +8,12 @@
 # Run it again any time to update. Your settings and max prices live in WTF/,
 # so they are kept.
 #
+# The first run also:
+#   - remembers your WoW folder (~/.config/wb_AHSnipe/wow_dir), so later runs
+#     skip the search
+#   - adds an "Update AH Snipe" icon to your desktop and app menu. Double-click
+#     it to update. Right-click it > Add to Steam to update from Game Mode.
+#
 # If it can't find WoW, pass the _forever_ folder yourself:
 #   bash install-steamdeck.sh "/path/to/World of Warcraft/_forever_"
 # or set WOW_DIR to it.
@@ -49,7 +55,14 @@ find_wow() {
   done | awk '!seen[$0]++'
 }
 
+CONF_DIR="$HOME/.config/wb_AHSnipe"
+SAVED="$CONF_DIR/wow_dir"
+
 WOW="${1:-${WOW_DIR:-}}"
+if [[ -z "$WOW" && -f "$SAVED" ]]; then
+  WOW="$(cat "$SAVED")"
+  [[ -d "$WOW" ]] || { warn "Saved WoW folder is gone, searching again."; WOW=""; }
+fi
 if [[ -z "$WOW" ]]; then
   info "Looking for your WoW Forever folder ($FLAVOR), this can take a minute…"
   mapfile -t found < <(find_wow)
@@ -74,6 +87,8 @@ fi
 ADDONS="$WOW/Interface/AddOns"
 mkdir -p "$ADDONS"
 ok "WoW Forever: $WOW"
+mkdir -p "$CONF_DIR"
+printf '%s\n' "$WOW" > "$SAVED"
 
 # --- Download the latest version --------------------------------------------
 tmp="$(mktemp -d)"
@@ -110,3 +125,30 @@ info "$dest"
 echo
 info "${bold}Fully restart WoW${rst} (not just /reload) so it picks up new files."
 info "Your max prices and settings are kept."
+
+# --- One-click updater icon ------------------------------------------------
+# Always pulls the newest installer, so the icon itself never goes stale.
+APP="$HOME/.local/share/applications/wb-ahsnipe-update.desktop"
+if [[ ! -f "$APP" ]]; then
+  mkdir -p "$(dirname "$APP")"
+  cat > "$APP" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Update AH Snipe
+Comment=Download and install the latest wb_AHSnipe for WoW Forever
+Exec=bash -c 'curl -fsSL https://raw.githubusercontent.com/$REPO/$BRANCH/tools/install-steamdeck.sh -o /tmp/wb-ahsnipe-install.sh && bash /tmp/wb-ahsnipe-install.sh; echo; read -rp "Press Enter to close."'
+Icon=system-software-update
+Terminal=true
+Categories=Game;
+DESKTOP
+  chmod +x "$APP"
+  if [[ -d "$HOME/Desktop" ]]; then
+    cp "$APP" "$HOME/Desktop/"
+    chmod +x "$HOME/Desktop/wb-ahsnipe-update.desktop"
+    # KDE: mark it trusted so double-click runs it without a prompt
+    command -v gio >/dev/null && gio set "$HOME/Desktop/wb-ahsnipe-update.desktop" metadata::trusted true 2>/dev/null || true
+  fi
+  echo
+  ok "Added an ${bold}Update AH Snipe${rst} icon to your desktop and app menu."
+  info "Next time, just double-click it. To update from Game Mode: right-click it > Add to Steam."
+fi

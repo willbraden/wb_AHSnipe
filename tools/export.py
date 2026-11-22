@@ -4,6 +4,8 @@ purchases.csv  one row per buy attempt (bought, failed, rejected, no answer)
 bait.csv       every bait listing seen (fewer units than Min qty, well under
                the next real price), rebuilt each run from the addon's saved list
 prices.csv     results of each Check prices run
+winrates.csv   win rate by item, Buy %, hour, weekday and cheap units listed,
+               rebuilt from all of purchases.csv each run
 deals.csv      favorites dips at or under your max, how long they lasted,
                and whether you bought during the dip
 
@@ -242,3 +244,42 @@ print(f"deals.csv: +{n2} rows ({len(deals)} in this log)")
 n3 = append("prices.csv", C_COLS, checks)
 print(f"prices.csv: +{n3} rows ({len(checks)} in this log)")
 print(f"bait.csv: {len(bait_rows)} bait listings (rebuilt)")
+
+
+# ------------------------------------------------------------------ winrates
+# Built from the full purchases.csv history, not just this log.
+W_COLS = ["dimension", "item", "bucket", "tries", "won", "win_pct", "units_won", "units_per_try"]
+path = os.path.join(HERE, "purchases.csv")
+hist = list(csv.DictReader(open(path, newline="", encoding="utf-8"))) if os.path.exists(path) else []
+groups = {}
+def add(dim, item, bucket, r):
+    g = groups.setdefault((dim, item, bucket), {"tries": 0, "won": 0, "units": 0})
+    g["tries"] += 1
+    if r["result"] == "bought":
+        g["won"] += 1
+        g["units"] += int(r["qty"] or 0)
+def avail_bucket(v):
+    try: v = int(v)
+    except (TypeError, ValueError): return "unknown"
+    return "1-5" if v <= 5 else "6-20" if v <= 20 else "21-50" if v <= 50 else "51+"
+for r in hist:
+    if r.get("result") not in ("bought", "failed", "rejected", "no answer"):
+        continue
+    hour = r["time"][:2]
+    wd = datetime.datetime.strptime(r["date"], "%Y-%m-%d").strftime("%a")
+    add("item", r["item"], "all", r)
+    add("item_buy_pct", r["item"], r.get("buy_pct") or "?", r)
+    add("item_hour", r["item"], hour, r)
+    add("item_cheap_listed", r["item"], avail_bucket(r.get("cheap_available")), r)
+    add("hour", "all", hour, r)
+    add("weekday", "all", wd, r)
+    add("buy_pct", "all", r.get("buy_pct") or "?", r)
+    add("cheap_listed", "all", avail_bucket(r.get("cheap_available")), r)
+wrows = []
+for (dim, item, bucket), g in sorted(groups.items()):
+    wrows.append({"dimension": dim, "item": item, "bucket": bucket, "tries": g["tries"], "won": g["won"],
+                  "win_pct": round(100 * g["won"] / g["tries"]), "units_won": g["units"],
+                  "units_per_try": round(g["units"] / g["tries"], 1)})
+with open(os.path.join(HERE, "winrates.csv"), "w", newline="", encoding="utf-8") as fh:
+    w = csv.DictWriter(fh, fieldnames=W_COLS); w.writeheader(); w.writerows(wrows)
+print(f"winrates.csv: {len(wrows)} rows from {len(hist)} purchase attempts (rebuilt)")

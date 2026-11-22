@@ -183,8 +183,45 @@ end
 
 -- Win/loss per item: this session, and all-time in DB.stats.
 local session = {}
+
+-- Learning the best Buy % per item -----------------------------------------
+-- Explore mode tries these, least-tested first, for each item.
+local PCTS = { 35, 50, 66, 85, 100 }
+local attemptPct = {} -- itemID -> Buy % used for the attempt in progress
+
+local function PickPct(id)
+  if DB.explore then
+    local t = DB.tune and DB.tune[id] or {}
+    local best, bestN
+    for _, p in ipairs(PCTS) do
+      local r = t[p]
+      local n = r and (r.won + r.lost) or 0
+      if not best or n < bestN or (n == bestN and math.random() < 0.5) then best, bestN = p, n end
+    end
+    return best
+  end
+  return (DB.itemPct and DB.itemPct[id]) or DB.buyPct or BUY_PCT
+end
+
+-- Record one attempt against Buy % and hour of day.
+local function TallyTune(id, won, qty)
+  local p = attemptPct[id]
+  DB.hourly = DB.hourly or {}
+  local h = tonumber(date("%H"))
+  local hr = DB.hourly[h] or { won = 0, lost = 0 }
+  DB.hourly[h] = hr
+  if won then hr.won = hr.won + 1 else hr.lost = hr.lost + 1 end
+  if not p then return end
+  DB.tune = DB.tune or {}
+  DB.tune[id] = DB.tune[id] or {}
+  local r = DB.tune[id][p] or { won = 0, lost = 0, units = 0 }
+  DB.tune[id][p] = r
+  if won then r.won = r.won + 1; r.units = r.units + (qty or 0) else r.lost = r.lost + 1 end
+end
+
 local function Tally(id, won, qty, total)
   if not id or not DB then return end
+  TallyTune(id, won, qty)
   DB.stats = DB.stats or {}
   for _, t in ipairs({ session, DB.stats }) do
     local r = t[id] or { won = 0, lost = 0, units = 0, spent = 0 }
@@ -347,6 +384,7 @@ end
 function wb_AHSnipe_Refresh(fromBuy)
   local ah = AH()
   if not ah then return end
+  if wb_AHSnipe_Checking then return end
   local now = GetTime()
   local src = fromBuy and "buy" or "key"
   if not fromBuy and now - sentAt < MIN_GAP then
@@ -577,7 +615,8 @@ local function BuyCommodity()
   -- Ask for only part of the cheap units. If another buyer takes a few
   -- before you confirm, there are still enough left at the quoted price.
   local avail = qty
-  local pct = DB.buyPct or BUY_PCT
+  local pct = PickPct(itemID)
+  attemptPct[itemID] = pct
   local want = math.max(1, math.ceil(avail * pct / 100))
   if want < avail then
     qty, total = 0, 0
@@ -600,6 +639,8 @@ local lastPressAt = 0
 function wb_AHSnipe_Buy()
   local ah = AH()
   if not ah then return end
+  if wb_AHSnipe_Checking then return end
+  if wb_AHSnipe_StaleBlock and wb_AHSnipe_StaleBlock() then return end
   local now = GetTime()
   local view = (ah.ItemBuyFrame and ah.ItemBuyFrame:IsShown() and "item")
     or (ah.CommoditiesBuyFrame and ah.CommoditiesBuyFrame:IsShown() and "commodity")
@@ -743,6 +784,13 @@ SlashCmdList.WBAHSNIPE = function(input)
     elseif val == "off" then wb_AHSnipeLog.off = true msg("Logging off.")
     elseif val == "on" then wb_AHSnipeLog.off = nil msg("Logging on.")
     else msg("Log has " .. #wb_AHSnipeLog.rows .. " entries" .. (wb_AHSnipeLog.off and " (logging is off)" or "") .. ". /reload to save it to disk. /snipe log clear | on | off") end
+  elseif cmd == "tune" then
+    if val == "apply" then wb_AHSnipe_TuneApplyAll() end
+    wb_AHSnipe_TuneWindow()
+  elseif cmd == "explore" then
+    DB.explore = not DB.explore
+    if settings and settings.explore then settings.explore:SetChecked(DB.explore) end
+    msg("Explore Buy %: " .. (DB.explore and "|cff55ff55on|r" or "|cffff5555off|r"))
   elseif cmd == "stats" then
     wb_AHSnipe_Stats(val == "all")
   elseif cmd == "tab" then
@@ -873,6 +921,9 @@ local function BigBox(parent, name, width, numeric, height, fontSize)
   end
   e:SetTextInsets(10, 12, 0, 0)
   if numeric then e:SetNumeric(true) end
+  -- When a value is set from code, scroll back to the start so the whole
+  -- number shows instead of just its last digits.
+  hooksecurefunc(e, "SetText", function(self) if not self:HasFocus() then self:SetCursorPosition(0) end end)
   return e
 end
 
@@ -928,8 +979,12 @@ local function BuildBox()
 
   -- Settings window, to the right of the AH.
   settings = AHFrame("wb_AHSnipeSettings", AuctionHouseFrame, "AH Snipe")
-  settings:SetSize(290, 236)
+  settings:SetSize(290, 340)
   settings:SetPoint("TOPLEFT", AuctionHouseFrame, "TOPRIGHT", 4, 0)
+  -- Everything made after this point belongs to the Settings tab.
+  local frameParts = {}
+  for _, c in ipairs({ settings:GetChildren() }) do frameParts[c] = true end
+  for _, r in ipairs({ settings:GetRegions() }) do frameParts[r] = true end
 
   local function Row(text, y)
     local fs = settings:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -953,12 +1008,12 @@ local function BuildBox()
     local boxes = {}
     for k, coin in ipairs(coins) do
       -- Gold can run to 5 digits; silver and copper never pass 2.
-      local w = coin.key == "g" and 96 or 56
-      local x = coin.key == "g" and 16 or coin.key == "s" and 124 or 192
-      local e = BigBox(settings, "wb_AHSnipeMax" .. coin.key, w, true, 36, 18)
+      local w = coin.key == "g" and 96 or 66
+      local x = coin.key == "g" and 16 or coin.key == "s" and 122 or 198
+      local e = BigBox(settings, "wb_AHSnipeMax" .. coin.key, w, true, 36, 16)
       e:SetMaxLetters(coin.key == "g" and 5 or 2)
       e:SetJustifyH("LEFT")
-      e:SetTextInsets(8, 24, 0, 0)
+      e:SetTextInsets(10, 26, 0, 0)
       e:SetPoint("TOPLEFT", settings, "TOPLEFT", x, -48)
       local icon = e:CreateTexture(nil, "OVERLAY")
       icon:SetSize(14, 14)
@@ -975,9 +1030,9 @@ local function BuildBox()
 
   -- Min quantity (commodities)
   Row("Min qty", -96)
-  local minBox = BigBox(settings, "wb_AHSnipeMinBox", 64, true, 36, 18)
+  local minBox = BigBox(settings, "wb_AHSnipeMinBox", 66, true, 36, 16)
   minBox:SetJustifyH("LEFT")
-  minBox:SetTextInsets(8, 8, 0, 0)
+  minBox:SetTextInsets(10, 10, 0, 0)
   minBox:SetMaxLetters(4)
   minBox:SetPoint("TOPLEFT", settings, "TOPLEFT", 16, -112)
   minBox:SetText(tostring(DB.minQty or MIN_QTY))
@@ -995,30 +1050,82 @@ local function BuildBox()
 
   -- Buy %: share of the cheap units each buy asks for
   -- Same line as Min qty, lined up with the silver box above.
-  local pctLabel = settings:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  pctLabel:SetPoint("TOPLEFT", settings, "TOPLEFT", 124, -96)
+  -- Buy % and Explore live together in one bordered box: Explore takes over
+  -- the Buy % input while it's on.
+  local buyGroup = CreateFrame("Frame", "wb_AHSnipeBuyGroup", settings, "BackdropTemplate")
+  buyGroup:SetPoint("TOPLEFT", settings, "TOPLEFT", 12, -160)
+  buyGroup:SetSize(266, 72)
+  buyGroup:SetBackdrop({
+    bgFile = "Interface\\Buttons\\WHITE8X8",
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    edgeSize = 12,
+    insets = { left = 3, right = 3, top = 3, bottom = 3 },
+  })
+  buyGroup:SetBackdropColor(1, 1, 1, 0.04)
+  buyGroup:SetBackdropBorderColor(0.48, 0.36, 0.24, 0.9)
+  settings.buyGroup = buyGroup
+
+  local pctLabel = buyGroup:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  pctLabel:SetPoint("TOPLEFT", buyGroup, "TOPLEFT", 10, -8)
   pctLabel:SetText("Buy %")
-  local pctBox = BigBox(settings, "wb_AHSnipePctBox", 64, true, 36, 18)
+  local pctTag = buyGroup:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  pctTag:SetPoint("LEFT", pctLabel, "RIGHT", 4, 0)
+  settings.pctTag = pctTag
+  local pctBox = BigBox(settings, "wb_AHSnipePctBox", 66, true, 36, 16)
   pctBox:SetJustifyH("LEFT")
-  pctBox:SetTextInsets(8, 8, 0, 0)
-  pctBox:SetPoint("TOPLEFT", settings, "TOPLEFT", 124, -112)
+  pctBox:SetTextInsets(10, 10, 0, 0)
+  pctBox:SetParent(buyGroup)
+  pctBox:SetPoint("TOPLEFT", buyGroup, "TOPLEFT", 10, -26)
   pctBox:SetMaxLetters(3)
   pctBox:SetText(tostring(DB.buyPct or BUY_PCT))
   local function SavePct(self, quiet)
-    local n = tonumber(self:GetText())
-    if n and n >= 1 and n <= 100 then
-      DB.buyPct = n
-      if not quiet then msg("Each buy asks for " .. n .. "% of the cheap units.") end
+    local id = OpenItemID()
+    local txt = strtrim(self:GetText() or "")
+    local n = tonumber(txt)
+    if id and txt == "" then
+      if DB.itemPct then DB.itemPct[id] = nil end
+      msg(ItemText(id) .. " now uses your general Buy % (" .. (DB.buyPct or BUY_PCT) .. "%).")
+    elseif n and n >= 1 and n <= 100 then
+      if id then
+        DB.itemPct = DB.itemPct or {}
+        DB.itemPct[id] = n
+        if not quiet then msg("Buy % for " .. ItemText(id) .. ": " .. n .. "%") end
+      else
+        DB.buyPct = n
+        if not quiet then msg("General Buy %: " .. n .. "% (items with their own keep theirs).") end
+      end
     end
-    self:SetText(tostring(DB.buyPct or BUY_PCT))
     self:ClearFocus()
   end
   pctBox:SetScript("OnEnterPressed", SavePct)
-  pctBox:SetScript("OnEscapePressed", function(self) self:SetText(tostring(DB.buyPct or BUY_PCT)); self:ClearFocus() end)
+  pctBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+
+  -- Check %: suggested max as a share of market, used by Check prices.
+  local ckLabel = settings:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  ckLabel:SetPoint("TOPLEFT", settings, "TOPLEFT", 122, -96)
+  ckLabel:SetText("Check %")
+  local ckBox = BigBox(settings, "wb_AHSnipeCheckPct", 66, true, 36, 16)
+  ckBox:SetJustifyH("LEFT")
+  ckBox:SetTextInsets(10, 10, 0, 0)
+  ckBox:SetPoint("TOPLEFT", settings, "TOPLEFT", 122, -112)
+  ckBox:SetMaxLetters(3)
+  ckBox:SetTextColor(1, 1, 1)
+  local function SaveCk(self)
+    local n = tonumber(self:GetText())
+    if n and n >= 1 and n <= 100 then
+      DB.checkPct = n
+      msg("Check prices will suggest " .. n .. "% of market.")
+    end
+    self:SetText(tostring(DB.checkPct or 70))
+    self:ClearFocus()
+  end
+  ckBox:SetScript("OnEnterPressed", SaveCk)
+  ckBox:SetScript("OnEscapePressed", function(self) self:SetText(tostring(DB.checkPct or 70)); self:ClearFocus() end)
+  settings.ckBox = ckBox
 
   local roam = CreateFrame("CheckButton", "wb_AHSnipeRoam", settings, "UICheckButtonTemplate")
   roam:SetSize(28, 28)
-  roam:SetPoint("TOPLEFT", settings, "TOPLEFT", 12, -158)
+  roam:SetPoint("TOPLEFT", settings, "TOPLEFT", 12, -238)
   local roamText = roam:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   roamText:SetPoint("LEFT", roam, "RIGHT", 4, 0)
   roamText:SetText("Jump in and out of favorites")
@@ -1028,6 +1135,28 @@ local function BuildBox()
     L("roam", { on = DB.roam and 1 or 0 })
   end)
   settings.roam = roam
+
+  local explore = CreateFrame("CheckButton", "wb_AHSnipeExplore", buyGroup, "UICheckButtonTemplate")
+  explore:SetSize(28, 28)
+  explore:SetPoint("LEFT", pctBox, "RIGHT", 12, 0)
+  local exText = explore:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  exText:SetPoint("LEFT", explore, "RIGHT", 2, 6)
+  exText:SetText("Explore")
+  local exSub = explore:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  exSub:SetPoint("TOPLEFT", exText, "BOTTOMLEFT", 0, -2)
+  exSub:SetText("sets Buy % automatically")
+  explore:SetChecked(DB.explore and true or false)
+  explore:SetScript("OnClick", function(self)
+    DB.explore = self:GetChecked() and true or false
+    L("explore", { on = DB.explore and 1 or 0 })
+  end)
+  settings.explore = explore
+
+  local tuneBtn = CreateFrame("Button", "wb_AHSnipeTuneButton", settings, "UIPanelButtonTemplate")
+  tuneBtn:SetSize(258, 26)
+  tuneBtn:SetPoint("BOTTOM", settings, "BOTTOM", 0, 42)
+  tuneBtn:SetText("Buy % results")
+  tuneBtn:SetScript("OnClick", function() wb_AHSnipe_SelectTab(2) end)
 
   local checkBtn = CreateFrame("Button", "wb_AHSnipeCheckButton", settings, "UIPanelButtonTemplate")
   checkBtn:SetSize(258, 28)
@@ -1052,7 +1181,30 @@ local function BuildBox()
     if t < 0.25 then return end
     t = 0
     if not minBox:HasFocus() then minBox:SetText(tostring(DB.minQty or MIN_QTY)) end
-    if not pctBox:HasFocus() then pctBox:SetText(tostring(DB.buyPct or BUY_PCT)) end
+    -- Explore on: Buy % is chosen automatically, so the box is locked.
+    if DB.explore then
+      if pctBox:HasFocus() then pctBox:ClearFocus() end
+      pctBox:Disable()
+      pctBox:SetNumeric(false) -- numeric boxes may refuse letters
+      pctBox:SetText("auto")
+      pctBox:SetTextColor(0.5, 0.5, 0.5)
+      if pctBox.SetBackdropColor then pctBox:SetBackdropColor(0.05, 0.05, 0.05, 0.6) end
+      settings.pctTag:SetText("exploring")
+    else
+      if not pctBox:IsEnabled() then
+        pctBox:Enable()
+        pctBox:SetNumeric(true)
+        pctBox:SetTextColor(1, 1, 1)
+        if pctBox.SetBackdropColor then pctBox:SetBackdropColor(0.09, 0.07, 0.05, 0.95) end
+      end
+      if not pctBox:HasFocus() then
+        local oid = OpenItemID()
+        local own = oid and DB.itemPct and DB.itemPct[oid]
+        pctBox:SetText(tostring(own or DB.buyPct or BUY_PCT))
+        settings.pctTag:SetText(own and "item" or oid and "general" or "all")
+      end
+    end
+    if settings.ckBox and not settings.ckBox:HasFocus() then settings.ckBox:SetText(tostring(DB.checkPct or 70)) end
     if self:HasFocus() or sBox:HasFocus() or cBox:HasFocus() then return end
     local id = OpenItemID()
     local saved = id and DB.caps[id]
@@ -1067,6 +1219,26 @@ local function BuildBox()
       self:SetText(""); sBox:SetText(""); cBox:SetText("")
     end
   end)
+
+  -- Tabs along the bottom edge, like the AH's Buy / Sell / Auctions.
+  settings.page1 = {}
+  for _, c in ipairs({ settings:GetChildren() }) do
+    if not frameParts[c] and c ~= settings.cancelBtn then tinsert(settings.page1, c) end
+  end
+  for _, r in ipairs({ settings:GetRegions() }) do if not frameParts[r] then tinsert(settings.page1, r) end end
+  local tabs = { "Settings", "Buy %" }
+  for i, label in ipairs(tabs) do
+    local ok, tab = pcall(CreateFrame, "Button", "wb_AHSnipeSettingsTab" .. i, settings, "PanelTabButtonTemplate")
+    if not ok or not tab then tab = CreateFrame("Button", "wb_AHSnipeSettingsTab" .. i, settings, "UIPanelButtonTemplate"); tab:SetSize(90, 24) end
+    tab:SetID(i)
+    tab:SetText(label)
+    if PanelTemplates_TabResize then pcall(PanelTemplates_TabResize, tab, 0) end
+    if i == 1 then tab:SetPoint("TOPLEFT", settings, "BOTTOMLEFT", 10, 2)
+    else tab:SetPoint("LEFT", _G["wb_AHSnipeSettingsTab" .. (i - 1)], "RIGHT", 2, 0) end
+    tab:SetScript("OnClick", function() wb_AHSnipe_SelectTab(i) end)
+  end
+  if PanelTemplates_SetNumTabs then pcall(PanelTemplates_SetNumTabs, settings, #tabs) end
+  wb_AHSnipe_SelectTab(1)
 end
 
 local ui = CreateFrame("Frame")
@@ -1450,6 +1622,27 @@ local function ShowCheckPanel()
       fs:SetText(h[1])
     end
     checkPanel.rows = {}
+
+    -- Scrolling list: about 10 rows show at once; mouse wheel or scroll bar for the rest.
+    local sf
+    for _, tpl in ipairs({ "ScrollFrameTemplate", "UIPanelScrollFrameTemplate" }) do
+      local ok, f = pcall(CreateFrame, "ScrollFrame", "wb_AHSnipeCheckScroll", checkPanel, tpl)
+      if ok and f then sf = f break end
+    end
+    sf = sf or CreateFrame("ScrollFrame", "wb_AHSnipeCheckScroll", checkPanel)
+    sf:SetPoint("TOPLEFT", checkPanel, "TOPLEFT", 0, -58)
+    sf:SetPoint("BOTTOMRIGHT", checkPanel, "BOTTOMRIGHT", -28, 42)
+    sf:EnableMouseWheel(true)
+    sf:SetScript("OnMouseWheel", function(self, delta)
+      local max = self:GetVerticalScrollRange()
+      local v = math.max(0, math.min(max, self:GetVerticalScroll() - delta * 40))
+      self:SetVerticalScroll(v)
+    end)
+    local content = CreateFrame("Frame", nil, sf)
+    content:SetSize(392, 20)
+    sf:SetScrollChild(content)
+    checkPanel.scroll, checkPanel.content = sf, content
+
     local all = CreateFrame("Button", nil, checkPanel, "UIPanelButtonTemplate")
     all:SetSize(120, 24); all:SetPoint("BOTTOMLEFT", 12, 10); all:SetText("Apply all")
     all:SetScript("OnClick", function()
@@ -1467,18 +1660,18 @@ local function ShowCheckPanel()
 
   local items = lastCheck.items
   checkPanel:ClearAllPoints()
-  if settings then checkPanel:SetPoint("TOPLEFT", settings, "BOTTOMLEFT", 0, -6)
+  if settings then checkPanel:SetPoint("TOPLEFT", settings, "BOTTOMLEFT", 0, -36)
   else checkPanel:SetPoint("TOPLEFT", AuctionHouseFrame, "TOPRIGHT", 4, -30) end
-  checkPanel:SetSize(420, 100 + #items * 20)
+  checkPanel:SetSize(430, 100 + math.min(#items, 10) * 20)
+  checkPanel.content:SetSize(392, math.max(20, #items * 20))
   checkPanel.title:SetText("Price check: " .. #items .. " favorites")
-  checkPanel.note:SetText(("Suggest = %d%% of market (%s)"):format(math.floor(lastCheck.ratio * 100 + 0.5),
-    lastCheck.learned and "your usual ratio" or "default"))
+  checkPanel.note:SetText(("Suggest = %d%% of market (Check %% in the AH Snipe window)"):format(math.floor(lastCheck.ratio * 100 + 0.5)))
 
   for i, r in ipairs(items) do
     local row = checkPanel.rows[i]
     if not row then
-      row = CreateFrame("Frame", nil, checkPanel)
-      row:SetSize(400, 20)
+      row = CreateFrame("Frame", nil, checkPanel.content)
+      row:SetSize(392, 20)
       row.name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
       row.name:SetPoint("LEFT", 12, 0); row.name:SetWidth(124); row.name:SetJustifyH("LEFT"); row.name:SetWordWrap(false)
       row.market = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall"); row.market:SetPoint("LEFT", 140, 0)
@@ -1488,7 +1681,7 @@ local function ShowCheckPanel()
       row.apply:SetSize(40, 18); row.apply:SetPoint("RIGHT", -4, 0); row.apply:SetText("Set")
       checkPanel.rows[i] = row
     end
-    row:SetPoint("TOPLEFT", 0, -60 - (i - 1) * 20)
+    row:SetPoint("TOPLEFT", checkPanel.content, "TOPLEFT", 0, -(i - 1) * 20)
     row.name:SetText(ItemText(r.id))
     row.market:SetText(r.market and money(r.market) or "|cff888888none|r")
     local cur = DB.caps[r.id]
@@ -1524,93 +1717,117 @@ end
 
 function wb_AHSnipe_CancelCheck()
   if not check then CheckButtons(false) return end
-  L("check_cancel", { at = check.i, of = #check.list })
+  L("check_cancel", { at = check.i or 0, of = check.list and #check.list or 0 })
   check = nil
+  wb_AHSnipe_Checking = nil
   CheckButtons(false)
   msg("Price check cancelled.")
 end
 
+local CHECK_PCT = 70 -- default: suggested max = 70% of market
+
 local function FinishCheck()
-  local ratios = {}
-  for _, r in ipairs(check.items) do
-    local cur = DB.caps[r.id]
-    if cur and r.market and r.market > 0 then ratios[#ratios + 1] = cur / r.market end
-  end
-  table.sort(ratios)
-  local ratio, learned = 0.70, false
-  if #ratios >= 3 then
-    ratio = ratios[math.ceil(#ratios / 2)]
-    ratio = math.max(0.5, math.min(0.95, ratio))
-    learned = true
-  end
+  local ratio = (DB.checkPct or CHECK_PCT) / 100
   for _, r in ipairs(check.items) do
     if r.market then r.suggest = math.max(1, math.floor(r.market * ratio)) end
     L("price_check", { item = r.id, market = r.market, cheapest = r.cheapest, listed = r.listed,
       now = DB.caps[r.id], suggest = r.suggest, ratio = math.floor(ratio * 100 + 0.5) })
   end
-  lastCheck = { items = check.items, ratio = ratio, learned = learned, at = time() }
+  lastCheck = { items = check.items, ratio = ratio, at = time() }
+  DB.lastCheckAt = time()
   check = nil
+  wb_AHSnipe_Checking = nil
   CheckButtons(false)
   ShowCheckPanel()
-  wb_AHSnipe_Favorites()
+  msg("Price check done. Review the suggestions and Apply.")
 end
 
+local function StartList()
+  local res = C_AuctionHouse.GetBrowseResults() or {}
+  local list = {}
+  for _, r in ipairs(res) do if r.itemKey then list[#list + 1] = r end end
+  if #list == 0 then
+    msg("Your favorites list is empty.")
+    wb_AHSnipe_CancelCheck()
+    return
+  end
+  check.list, check.i, check.waitFav = list, 0, nil
+  L("check_start", { count = #list })
+end
+
+-- One click: load favorites if needed, then check every item on its own,
+-- one search at a time, waiting for the AH between searches.
 function wb_AHSnipe_Check()
   local ah = AH()
   if not ah then return end
+  if check then return end -- already running; use Cancel to stop
+  check = { items = {} }
+  wb_AHSnipe_Checking = true
+  CheckButtons(true)
+  local onFavs = lastBrowse == "fav" and ah.BrowseResultsFrame and ah.BrowseResultsFrame:IsShown()
+  if onFavs and #(C_AuctionHouse.GetBrowseResults() or {}) > 0 then
+    StartList()
+  else
+    check.waitFav = true
+    if settings and settings.checkBtn then settings.checkBtn:SetText("Loading favorites") end
+    wb_AHSnipe_Favorites()
+  end
+end
+
+local SORT = { { sortOrder = (Enum.AuctionHouseSortOrder and Enum.AuctionHouseSortOrder.Price) or 0, reverseSort = false } }
+
+local driver = CreateFrame("Frame")
+local dt = 0
+driver:SetScript("OnUpdate", function(_, el)
+  dt = dt + el
+  if dt < 0.05 then return end
+  dt = 0
+  if not check or check.waitFav or not check.list then return end
+  if not AH() then wb_AHSnipe_CancelCheck() return end
   local now = GetTime()
 
-  if not check then
-    local onFavs = lastBrowse == "fav" and ah.BrowseResultsFrame and ah.BrowseResultsFrame:IsShown()
-    local res = onFavs and C_AuctionHouse.GetBrowseResults() or {}
-    if #res == 0 then
-      msg("Opening favorites first. Press Check prices again once the list shows.")
-      wb_AHSnipe_Favorites()
-      return
-    end
-    local list = {}
-    for _, r in ipairs(res) do if r.itemKey then list[#list + 1] = r end end
-    check = { list = list, i = 0, items = {} }
-    CheckButtons(true)
-    L("check_start", { count = #list })
-  end
-
-  -- Still waiting for the last item's listings?
-  if check.cur and not check.cur.done and now - check.cur.at < CHECK_TIMEOUT then return end
+  -- Waiting for the current item's listings.
   if check.cur and not check.cur.done then
-    check.items[#check.items + 1] = { id = check.cur.id }
+    if now - check.cur.at < CHECK_TIMEOUT then return end
+    check.items[#check.items + 1] = { id = check.cur.id } -- no answer: mark "none"
     check.cur.done = true
   end
-  -- Our own wait flag never outlives the timeout here.
-  if pending and now - sentAt > CHECK_TIMEOUT then pending = false end
-  if Queued() or buying or pending then return end
+  if Queued() or buying or not C_AuctionHouse.IsThrottledMessageSystemReady() then return end
 
   check.i = check.i + 1
   local r = check.list[check.i]
   if not r then FinishCheck() return end
-  check.cur = { r = r, id = r.itemKey.itemID, key = r.itemKey, at = now }
-  pending, sentAt = true, now
-  -- Opening an item from inside another item's page never sends a search,
-  -- so step back to the list first. The new item page then loads normally.
-  local inItem = (ah.CommoditiesBuyFrame and ah.CommoditiesBuyFrame:IsShown()) or (ah.ItemBuyFrame and ah.ItemBuyFrame:IsShown())
-  if inItem and ah.SetDisplayMode and AuctionHouseFrameDisplayMode then
-    ah:SetDisplayMode(AuctionHouseFrameDisplayMode.Buy)
-  end
-  L("check_open", { item = check.cur.id, n = check.i, of = #check.list, fromItem = inItem and 1 or 0 })
+  check.cur = { id = r.itemKey.itemID, key = r.itemKey, at = now }
   if settings and settings.checkBtn then
     settings.checkBtn:SetText(("Checking %d of %d"):format(check.i, #check.list))
   end
-  if not OpenDeal(r) then
+  L("check_open", { item = check.cur.id, n = check.i, of = #check.list })
+  local ok = pcall(C_AuctionHouse.SendSearchQuery, r.itemKey, SORT, true)
+  if not ok then
     check.items[#check.items + 1] = { id = check.cur.id }
     check.cur.done = true
   end
-end
+end)
 
 local cf = CreateFrame("Frame")
 cf:RegisterEvent("COMMODITY_SEARCH_RESULTS_UPDATED")
 cf:RegisterEvent("ITEM_SEARCH_RESULTS_UPDATED")
+cf:RegisterEvent("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+cf:RegisterEvent("ADDON_ACTION_BLOCKED")
 cf:SetScript("OnEvent", function(_, e, a1)
-  local cur = check and check.cur
+  if not check then return end
+  if e == "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED" then
+    if check.waitFav and lastBrowse == "fav" then StartList() end
+    return
+  end
+  if e == "ADDON_ACTION_BLOCKED" then
+    if a1 == "wb_AHSnipe" then
+      msg("|cffff5555The game blocked the automatic price check.|r Cancelled.")
+      wb_AHSnipe_CancelCheck()
+    end
+    return
+  end
+  local cur = check.cur
   if not cur or cur.done then return end
   local market, cheapest, listed
   if e == "COMMODITY_SEARCH_RESULTS_UPDATED" and a1 == cur.id then
@@ -1623,14 +1840,55 @@ cf:SetScript("OnEvent", function(_, e, a1)
   if not market then return end -- empty first update; wait for the real list
   cur.done = true
   check.items[#check.items + 1] = { id = cur.id, market = market, cheapest = cheapest, listed = listed }
-  if check.i >= #check.list then
-    if settings and settings.checkBtn then settings.checkBtn:SetText("Done: press once more to see results") end
+end)
+
+-- Stale prices reminder --------------------------------------------------------
+-- Each time you open the AH, if your last finished Check prices was 1+ hour
+-- ago, it asks whether to check prices first. Until you answer, the Snipe key
+-- won't buy.
+
+local STALE_HOURS = 1
+local staleAsked, staleAnswered = false, false
+
+StaticPopupDialogs["WBAHSNIPE_STALE"] = {
+  text = "%s\n\nCheck prices before sniping?",
+  button1 = "Check prices",
+  button2 = "Not now",
+  OnAccept = function() staleAnswered = true; wb_AHSnipe_Check() end,
+  OnCancel = function() staleAnswered = true end,
+  timeout = 0, whileDead = true, hideOnEscape = true, preferredIndex = 3,
+}
+
+function wb_AHSnipe_StaleBlock()
+  if not staleAsked or staleAnswered then return false end
+  if not StaticPopup_Visible("WBAHSNIPE_STALE") then
+    StaticPopup_Show("WBAHSNIPE_STALE", wb_AHSnipe_StaleText or "Your max prices may be out of date.")
   end
+  return true
+end
+
+local sf = CreateFrame("Frame")
+sf:RegisterEvent("AUCTION_HOUSE_SHOW")
+sf:SetScript("OnEvent", function()
+  staleAsked, staleAnswered = false, false -- ask again on every AH visit
+  if not DB then return end
+  local last = DB.lastCheckAt
+  local hours = last and (time() - last) / 3600
+  if last and hours < STALE_HOURS then return end
+  local ago
+  if hours and hours < 2 then ago = math.floor(hours * 60) .. " minutes"
+  elseif hours and hours < 48 then ago = math.floor(hours) .. " hours"
+  elseif hours then ago = math.floor(hours / 24) .. " days" end
+  wb_AHSnipe_StaleText = last
+    and ("|cffffd100AH Snipe|r\nYour max prices were last checked |cffffd100%s|r ago."):format(ago)
+    or "|cffffd100AH Snipe|r\nYou haven't run Check prices yet."
+  staleAsked = true
+  StaticPopup_Show("WBAHSNIPE_STALE", wb_AHSnipe_StaleText)
 end)
 
 
 -- Monospace chat font ---------------------------------------------------------
--- Puts every chat window in DejaVu Sans Mono (bundled in fonts\mono.ttf) at
+-- Puts every chat window in JetBrains Mono (bundled in fonts\mono.ttf) at
 -- its current size, so table lines and everything else line up. /snipe mono
 -- turns it on or off. Default: on.
 
@@ -1700,3 +1958,275 @@ tf:SetScript("OnEvent", function(self)
   self:UnregisterEvent("PLAYER_ENTERING_WORLD")
   C_Timer.After(2, wb_AHSnipe_SetupTab) -- after Blizzard restores chat windows
 end)
+
+
+-- /snipe tune ------------------------------------------------------------------
+-- For each item: win rate and units won per try at each Buy % tested.
+-- "Best" = the most units won per try (with at least MIN_TRIES tries), since a
+-- small sure win and a big risky one are both worth something.
+-- /snipe tune apply saves each item's best as its own Buy %.
+
+local MIN_TRIES = 4
+
+function wb_AHSnipe_Tune(apply)
+  local tune = DB.tune or {}
+  local ids = {}
+  for id in pairs(tune) do ids[#ids + 1] = id end
+  if #ids == 0 then
+    msg("No Buy % data yet. Turn on |cffffd100Explore Buy %|r in the AH Snipe window and snipe as usual.")
+    return
+  end
+  table.sort(ids, function(a, b)
+    local function n(id) local t = 0 for _, r in pairs(tune[id]) do t = t + r.won + r.lost end return t end
+    return n(a) > n(b)
+  end)
+  local function cell(t, n, right)
+    t = tostring(t or "")
+    local gap = string.rep(" ", math.max(0, n - Visible(t)))
+    return right and (gap .. t) or (t .. gap)
+  end
+  local applied = 0
+  for _, id in ipairs(ids) do
+    local t = tune[id]
+    local best, bestEV, untested = nil, -1, {}
+    local parts = {}
+    for _, p in ipairs(PCTS) do
+      local r = t[p]
+      local n = r and (r.won + r.lost) or 0
+      if n == 0 then
+        untested[#untested + 1] = p .. "%"
+        parts[#parts + 1] = cell("|cff666666" .. p .. "%  -|r", 16)
+      else
+        local win = math.floor(100 * r.won / n + 0.5)
+        local ev = r.units / n
+        if n >= MIN_TRIES and ev > bestEV then best, bestEV = p, ev end
+        local color = win >= 60 and "|cff55ff55" or win >= 30 and "|cffffd100" or "|cffff5555"
+        parts[#parts + 1] = cell(p .. "% " .. color .. win .. "%|r|cffaaaaaa/" .. n .. "|r", 16)
+      end
+    end
+    msg(cell(TruncateChars(ItemText(id), 20), 20) .. " " .. table.concat(parts, ""))
+    local cur = (DB.itemPct and DB.itemPct[id]) or DB.buyPct or BUY_PCT
+    local line
+    if best then
+      line = ("    best |cffffd100%d%%|r (%.1f units per try)"):format(best, bestEV)
+      if apply then
+        DB.itemPct = DB.itemPct or {}
+        DB.itemPct[id] = best
+        applied = applied + 1
+        line = line .. "  |cff55ff55saved|r"
+      elseif best ~= cur then
+        line = line .. ("  |cffaaaaaa(using %d%%)|r"):format(cur)
+      end
+    else
+      line = "    |cffaaaaaanot enough tries yet (need " .. MIN_TRIES .. " at one Buy %)|r"
+    end
+    if #untested > 0 then line = line .. "  |cffaaaaaatry next: " .. table.concat(untested, ", ") .. "|r" end
+    msg(line)
+  end
+  -- Best hours overall
+  local hours = {}
+  for h, r in pairs(DB.hourly or {}) do
+    local n = r.won + r.lost
+    if n >= 5 then hours[#hours + 1] = { h = h, win = r.won / n, n = n } end
+  end
+  table.sort(hours, function(a, b) return a.win > b.win end)
+  if #hours > 0 then
+    local hs = {}
+    for k = 1, math.min(3, #hours) do
+      local e = hours[k]
+      hs[#hs + 1] = ("%s %d%%"):format(date("%I%p", time({ year = 2000, month = 1, day = 1, hour = e.h })):gsub("^0", ""):lower(), math.floor(e.win * 100 + 0.5))
+    end
+    msg("|cffaaaaaaBest hours so far:|r " .. table.concat(hs, ", "))
+  end
+  if apply then
+    msg(applied > 0 and ("Saved Buy % for " .. applied .. " items. Turn off Explore to use them.") or "Nothing to save yet.")
+  elseif not DB.explore then
+    msg("|cffaaaaaaTurn on Explore Buy % to keep testing, or /snipe tune apply to save the bests.|r")
+  end
+end
+
+
+-- Buy % results window ------------------------------------------------------------
+-- The /snipe tune report as a table: each item's win rate and tries at each
+-- Buy %, the best one (most units won per try, 4+ tries), what it uses now,
+-- and buttons to save the best.
+
+local tuneWin
+
+local function TuneData()
+  local out = {}
+  for id, t in pairs(DB.tune or {}) do
+    local row = { id = id, cells = {}, n = 0, bestEV = -1 }
+    for k, p in ipairs(PCTS) do
+      local r = t[p]
+      local n = r and (r.won + r.lost) or 0
+      local c = { p = p, n = n }
+      if n > 0 then
+        c.win = math.floor(100 * r.won / n + 0.5)
+        c.ev = r.units / n
+        if n >= MIN_TRIES and c.ev > row.bestEV then row.best, row.bestEV = p, c.ev end
+      end
+      row.cells[k] = c
+      row.n = row.n + n
+    end
+    out[#out + 1] = row
+  end
+  table.sort(out, function(a, b) return a.n > b.n end)
+  return out
+end
+
+local function Using(id) return (DB.itemPct and DB.itemPct[id]) or DB.buyPct or BUY_PCT end
+
+function wb_AHSnipe_TuneApplyAll()
+  local n = 0
+  for _, row in ipairs(TuneData()) do
+    if row.best then
+      DB.itemPct = DB.itemPct or {}
+      DB.itemPct[row.id] = row.best
+      n = n + 1
+    end
+  end
+  msg(n > 0 and ("Saved the best Buy % for " .. n .. " items.") or "Not enough tries yet to save anything.")
+end
+
+local PCT_X, BEST_X, USING_X = 176, 480, 540
+
+local function RenderTune()
+  if not DB or not settings then return end
+  if not tuneWin then
+    tuneWin = CreateFrame("Frame", nil, settings)
+    tuneWin:SetPoint("TOPLEFT", settings, "TOPLEFT", 0, -24)
+    tuneWin:SetPoint("BOTTOMRIGHT", settings, "BOTTOMRIGHT", 0, 0)
+
+    local function Head(text, x)
+      local fs = tuneWin:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+      fs:SetPoint("TOPLEFT", x, -12)
+      fs:SetText(text)
+    end
+    Head("Item", 16)
+    for k, p in ipairs(PCTS) do Head(p .. "%", PCT_X + (k - 1) * 60) end
+    Head("Best", BEST_X)
+    Head("Using", USING_X)
+
+    tuneWin.note = tuneWin:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    tuneWin.note:SetJustifyH("LEFT")
+    tuneWin.note:SetWidth(680)
+    tuneWin.note:SetWordWrap(true)
+    tuneWin.hours = tuneWin:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    tuneWin.hours:SetJustifyH("LEFT")
+
+    local all = CreateFrame("Button", nil, tuneWin, "UIPanelButtonTemplate")
+    all:SetSize(170, 24); all:SetPoint("BOTTOMLEFT", 14, 12); all:SetText("Use best for all items")
+    all:SetScript("OnEnter", function(self)
+      GameTooltip:SetOwner(self, "ANCHOR_TOP")
+      GameTooltip:SetText("Use best for all items")
+      GameTooltip:AddLine("Saves each item's best Buy % (marked *) as that item's own Buy %. Items without enough tries keep your general Buy %.", 1, 1, 1, true)
+      GameTooltip:Show()
+    end)
+    all:SetScript("OnLeave", GameTooltip_Hide)
+    all:SetScript("OnClick", function() wb_AHSnipe_TuneApplyAll(); RenderTune() end)
+    tuneWin.rows = {}
+  end
+
+  local data = TuneData()
+  local n = math.max(1, #data)
+  settings:SetSize(720, 164 + n * 22)
+
+  for i, row in ipairs(data) do
+    local r = tuneWin.rows[i]
+    if not r then
+      r = CreateFrame("Frame", nil, tuneWin)
+      r:SetSize(700, 22)
+      r.name = r:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+      r.name:SetPoint("LEFT", 16, 0); r.name:SetWidth(150); r.name:SetJustifyH("LEFT"); r.name:SetWordWrap(false)
+      r.cells = {}
+      for k = 1, #PCTS do
+        local fs = r:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        fs:SetPoint("LEFT", PCT_X + (k - 1) * 60, 0)
+        r.cells[k] = fs
+      end
+      r.best = r:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall"); r.best:SetPoint("LEFT", BEST_X, 0)
+      r.using = r:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall"); r.using:SetPoint("LEFT", USING_X, 0)
+      r.set = CreateFrame("Button", nil, r, "UIPanelButtonTemplate")
+      r.set:SetSize(84, 20); r.set:SetPoint("RIGHT", -8, 0)
+      r.set:SetScript("OnLeave", GameTooltip_Hide)
+      tuneWin.rows[i] = r
+    end
+    r:SetPoint("TOPLEFT", 0, -30 - (i - 1) * 22)
+    r.name:SetText(ItemText(row.id))
+    for k, c in ipairs(row.cells) do
+      local fs = r.cells[k]
+      if c.n == 0 then
+        fs:SetText("|cff555555-|r")
+      else
+        local color = c.win >= 60 and "|cff55ff55" or c.win >= 30 and "|cffffd100" or "|cffff5555"
+        local mark = (c.p == row.best) and "|cffffd100*|r" or ""
+        fs:SetText(color .. c.win .. "%|r |cff888888" .. c.n .. "|r" .. mark)
+      end
+    end
+    local using = Using(row.id)
+    r.best:SetText(row.best and ("|cffffd100" .. row.best .. "%|r") or "|cff666666-|r")
+    r.using:SetText(using .. "%" .. ((DB.itemPct and DB.itemPct[row.id]) and "" or " |cff888888(all)|r"))
+    r.set:SetShown(row.best and row.best ~= using or false)
+    if row.best then r.set:SetText("Use " .. row.best .. "%") end
+    r.set:SetScript("OnEnter", function(self)
+      GameTooltip:SetOwner(self, "ANCHOR_TOP")
+      GameTooltip:SetText("Use " .. (row.best or "") .. "% for this item")
+      GameTooltip:AddLine("Saves " .. (row.best or "") .. "% as this item's own Buy %. Other items keep theirs.", 1, 1, 1, true)
+      GameTooltip:Show()
+    end)
+    r.set:SetScript("OnClick", function()
+      DB.itemPct = DB.itemPct or {}
+      DB.itemPct[row.id] = row.best
+      RenderTune()
+    end)
+    r:Show()
+  end
+  for i = #data + 1, #tuneWin.rows do tuneWin.rows[i]:Hide() end
+
+  local y = -30 - n * 22 - 10
+  tuneWin.note:ClearAllPoints()
+  tuneWin.note:SetPoint("TOPLEFT", 16, y)
+  if #data == 0 then
+    tuneWin.note:SetText("No Buy % data yet. Turn on |cffffd100Explore Buy %|r in the AH Snipe window and snipe as usual.")
+  else
+    tuneWin.note:SetText("Each cell: win rate, then tries.  |cffffd100*|r = best (most units won per try, "
+      .. MIN_TRIES .. "+ tries).\nUsing = the Buy % this item uses now; (all) = your general Buy % from the Settings tab.\n"
+      .. (DB.explore and "|cff55ff55Explore is on:|r it keeps rotating Buy % to learn. Turn it off to use the saved values."
+                     or "Explore is off: each item uses its saved Buy %, or your general one."))
+  end
+
+  local hours = {}
+  for h, hr in pairs(DB.hourly or {}) do
+    local tot = hr.won + hr.lost
+    if tot >= 5 then hours[#hours + 1] = { h = h, win = hr.won / tot } end
+  end
+  table.sort(hours, function(a, b) return a.win > b.win end)
+  local hs = {}
+  for k = 1, math.min(4, #hours) do
+    local e = hours[k]
+    local label = date("%I%p", time({ year = 2000, month = 1, day = 1, hour = e.h })):gsub("^0", ""):lower()
+    hs[#hs + 1] = label .. " " .. math.floor(e.win * 100 + 0.5) .. "%"
+  end
+  tuneWin.hours:ClearAllPoints()
+  tuneWin.hours:SetPoint("TOPLEFT", 16, y - 46)
+  tuneWin.hours:SetText(#hs > 0 and ("|cffaaaaaaBest hours:|r " .. table.concat(hs, "   ")) or "")
+end
+
+-- Tabs: 1 = Settings, 2 = Buy % ----------------------------------------------------
+function wb_AHSnipe_SelectTab(i)
+  if not settings then msg("Open the auction house first.") return end
+  settings.tab = i
+  for _, el in ipairs(settings.page1 or {}) do el:SetShown(i == 1) end
+  if settings.cancelBtn then settings.cancelBtn:SetShown(i == 1 and wb_AHSnipe_Checking and true or false) end
+  if i == 1 then
+    if tuneWin then tuneWin:Hide() end
+    settings:SetSize(290, 340)
+  else
+    RenderTune()
+    tuneWin:Show()
+  end
+  if PanelTemplates_SetTab then pcall(PanelTemplates_SetTab, settings, i) end
+end
+
+function wb_AHSnipe_TuneWindow() wb_AHSnipe_SelectTab(2) end

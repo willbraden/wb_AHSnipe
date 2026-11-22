@@ -10,9 +10,10 @@ A World of Warcraft: Forever addon for fast auction house sniping with the stock
 - **Min qty** for commodities. Skips bait listings smaller than this.
 - **Buy %.** Each commodity buy asks for this share of the cheap units, so another buyer taking a few doesn't sink your whole purchase.
 - **Favorites mode.** On your favorites list, Snipe opens the best deal (furthest under its max). After 10 presses with nothing under max, it goes back to favorites. A checkbox (or keybind) turns this off so you can camp one item.
-- **Check prices.** With a Cancel button. Opens each favorite one press at a time, reads what's really listed, and suggests a max based on your usual discount from market.
+- **Check prices.** One click checks every favorite automatically and suggests a max at your **Check %** of market (default 70%). If it's been an hour since your last check, opening the AH asks you to check first, and Snipe won't buy until you answer.
+- **Explore Buy %.** Rotates Buy % (35 to 100%) to learn what wins per item. The **Buy %** tab shows win rate and tries for each, and saves the best per item.
 - **Green prices** in the native AH lists for anything at or under your max, plus `-32%` / `+40%` badges on favorites that moved 25% or more between refreshes and a `no max` tag on favorites without a max.
-- **Its own "AH Snipe" chat tab** with table-style results for buys, failures and price moves, each showing your max and your win rate for that item. Failures and price rises are grayed out. Columns line up exactly with the bundled monospace font (DejaVu Sans Mono); `/snipe tab` sends messages back to your main chat.
+- **Its own "AH Snipe" chat tab** with table-style results for buys, failures and price moves, each showing your max and your win rate for that item. Failures and price rises are grayed out. Columns line up exactly with the bundled monospace font (JetBrains Mono); `/snipe tab` sends messages back to your main chat.
 - **Session log** of every press, search, quote and purchase, plus a saved list of bait listings.
 
 ## Install
@@ -33,7 +34,7 @@ From Desktop Mode, in Konsole:
 curl -fsSL https://raw.githubusercontent.com/willbraden/wb_AHSnipe/main/tools/install-steamdeck.sh | bash
 ```
 
-It finds your `World of Warcraft/_forever_` folder (Steam Proton prefix, SD card, Heroic or Lutris), downloads the latest version and installs it. Run it again to update. If it can't find WoW, pass the folder: `bash install-steamdeck.sh "/path/to/World of Warcraft/_forever_"`.
+It finds your `World of Warcraft/_forever_` folder (Steam Proton prefix, SD card, Heroic or Lutris), downloads the latest version and installs it. It remembers the folder and adds an **Update AH Snipe** icon to your desktop: double-click it to update, or right-click it > Add to Steam to update from Game Mode. If it can't find WoW, pass the folder: `bash install-steamdeck.sh "/path/to/World of Warcraft/_forever_"`.
 
 ## Setup
 
@@ -61,6 +62,8 @@ Macros, if you prefer:
 | `/snipe max <gold>` | Max for the open item, or your default if none is open |
 | `/snipe default <gold>` | Default max for items without their own |
 | `/snipe clear` | Remove the open item's max |
+| `/snipe tune` | Open the Buy % tab (`/snipe tune apply` saves each item's best) |
+| `/snipe explore` | Turn Explore Buy % on or off |
 | `/snipe stats` | Win rate, units and average price per item this session (`/snipe stats all` for all-time) |
 | `/snipe status` | Show whether the AH is ready |
 | `/snipe mono` | Turn the monospace chat font on or off |
@@ -88,4 +91,4 @@ Running it again only adds new rows.
 
 - Commodities (herbs, ore, cloth) take two presses to buy: one for the server's price quote, one to confirm. Blizzard requires a separate key press for each.
 - Every action needs a real key press. The addon never buys on its own.
-- DejaVu Sans Mono is free to redistribute; its license is in `fonts/DejaVu-LICENSE.txt`.
+- JetBrains Mono is free to redistribute under the SIL Open Font License; see `fonts/JetBrainsMono-OFL.txt`.
