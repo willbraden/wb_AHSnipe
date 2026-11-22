@@ -12,6 +12,7 @@ A World of Warcraft: Forever addon for fast auction house sniping with the stock
 - **Favorites mode.** On your favorites list, Snipe opens the best deal (furthest under its max). After 10 presses with nothing under max, it goes back to favorites. A checkbox (or keybind) turns this off so you can camp one item.
 - **Check prices.** One click checks every favorite automatically and suggests a max at your **Check %** of market (default 70%). If it's been an hour since your last check, opening the AH asks you to check first, and Snipe won't buy until you answer.
 - **Explore Buy %.** Rotates Buy % (35 to 100%) to learn what wins per item. The **Buy %** tab shows win rate and tries for each, and saves the best per item.
+- **Bought vs selling.** On the AH's Sell tab, shows what you paid for that item (this session and all-time average), the price you're posting at after the 5% AH cut, and your profit per unit and in total.
 - **Green prices** in the native AH lists for anything at or under your max, plus `-32%` / `+40%` badges on favorites that moved 25% or more between refreshes and a `no max` tag on favorites without a max.
 - **Its own "AH Snipe" chat tab** with table-style results for buys, failures and price moves, each showing your max and your win rate for that item. Failures and price rises are grayed out. Columns line up exactly with the bundled monospace font (JetBrains Mono); `/snipe tab` sends messages back to your main chat.
 - **Session log** of every press, search, quote and purchase, plus a saved list of bait listings.

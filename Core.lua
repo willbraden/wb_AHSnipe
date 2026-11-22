@@ -2237,3 +2237,125 @@ function wb_AHSnipe_SelectTab(i)
 end
 
 function wb_AHSnipe_TuneWindow() wb_AHSnipe_SelectTab(2) end
+
+-- Bought vs selling ---------------------------------------------------------
+-- On the AH's Sell tab, compare what you paid for the item in the sell slot
+-- (this session and all-time) with the price you're about to post at, after
+-- the auction house's 5% cut.
+
+local AH_CUT = 0.05
+local sellPanel
+
+local function SellFrame()
+  local ah = AH()
+  if not ah then return end
+  for _, name in ipairs({ "CommoditiesSellFrame", "ItemSellFrame" }) do
+    local f = ah[name]
+    if f and f:IsShown() then return f end
+  end
+end
+
+local function SellItemID(f)
+  local loc = (f.GetItem and select(2, pcall(f.GetItem, f))) or f.itemLocation
+  if type(loc) ~= "table" then return end
+  local ok, id = pcall(C_Item.GetItemID, loc)
+  return ok and id or nil
+end
+
+local function SellPrice(f)
+  local p = f.PriceInput
+  if p and p.GetAmount then
+    local ok, v = pcall(p.GetAmount, p)
+    if ok and v and v > 0 then return v end
+  end
+end
+
+local function SellQty(f)
+  local q = f.QuantityInput
+  if q and q.GetQuantity then
+    local ok, v = pcall(q.GetQuantity, q)
+    if ok and v and v > 0 then return v end
+  end
+  return 1
+end
+
+local function BuildSellPanel()
+  sellPanel = AHFrame("wb_AHSnipeSell", AuctionHouseFrame, "Bought vs selling")
+  sellPanel:SetSize(290, 178)
+  local function Line(y, label)
+    local l = sellPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    l:SetPoint("TOPLEFT", 14, y)
+    l:SetText(label or "")
+    local v = sellPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    v:SetPoint("TOPLEFT", 14, y - 14)
+    v:SetJustifyH("LEFT")
+    v:SetWidth(262)
+    return v
+  end
+  sellPanel.item = sellPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  sellPanel.item:SetPoint("TOPLEFT", 14, -32)
+  sellPanel.session = Line(-52, "Bought this session")
+  sellPanel.alltime = Line(-86, "Bought all-time")
+  sellPanel.selling = Line(-120, "Selling at")
+  sellPanel.profit = sellPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
+  sellPanel.profit:SetPoint("BOTTOMLEFT", 14, 12)
+  sellPanel.profit:SetJustifyH("LEFT")
+  sellPanel.profit:SetWidth(262)
+  sellPanel:Hide()
+end
+
+local function Avg(r) return r and r.units and r.units > 0 and (r.spent / r.units) or nil end
+
+local function UpdateSellPanel()
+  local f = SellFrame()
+  local id = f and SellItemID(f)
+  if not id then if sellPanel then sellPanel:Hide() end return end
+  if not sellPanel then BuildSellPanel() end
+  sellPanel:ClearAllPoints()
+  if settings then sellPanel:SetPoint("TOPLEFT", settings, "BOTTOMLEFT", 0, -36)
+  else sellPanel:SetPoint("TOPLEFT", AuctionHouseFrame, "TOPRIGHT", 4, -30) end
+
+  local s, a = session[id], DB.stats and DB.stats[id]
+  local sAvg, aAvg = Avg(s), Avg(a)
+  sellPanel.item:SetText(ItemText(id))
+  sellPanel.session:SetText(sAvg and (s.units .. " at " .. money(sAvg) .. " avg  |cffaaaaaa(" .. money(s.spent) .. ")|r")
+    or "|cff888888none|r")
+  sellPanel.alltime:SetText(aAvg and (a.units .. " at " .. money(aAvg) .. " avg") or "|cff888888none|r")
+
+  local price, qty = SellPrice(f), SellQty(f)
+  if not price then
+    sellPanel.selling:SetText("|cff888888set a price|r")
+    sellPanel.profit:SetText("")
+  else
+    local net = price * (1 - AH_CUT)
+    sellPanel.selling:SetText(money(price) .. " each  |cffaaaaaa(you get " .. money(math.floor(net)) .. " after the 5% cut)|r")
+    local cost = sAvg or aAvg
+    if not cost then
+      sellPanel.profit:SetText("|cffaaaaaaNo buys tracked for this item.|r")
+    else
+      local each = net - cost
+      local pct = math.floor(100 * each / cost + 0.5)
+      local color = each >= 0 and "|cff55ff55" or "|cffff5555"
+      local sign = each >= 0 and "+" or "-"
+      local per = sign .. money(math.floor(math.abs(each)))
+      local tot = sign .. money(math.floor(math.abs(each) * qty))
+      sellPanel.profit:SetText(color .. per .. " each (" .. sign .. math.abs(pct) .. "%)|r"
+        .. (qty > 1 and ("  |cffaaaaaax" .. qty .. " =|r " .. color .. tot .. "|r") or "")
+        .. ((not sAvg) and "\n|cff888888vs all-time avg|r" or ""))
+    end
+  end
+  sellPanel:Show()
+end
+
+local sp = CreateFrame("Frame")
+local spT = 0
+sp:SetScript("OnUpdate", function(_, el)
+  spT = spT + el
+  if spT < 0.25 then return end
+  spT = 0
+  if DB and AuctionHouseFrame and AuctionHouseFrame:IsShown() then
+    pcall(UpdateSellPanel)
+  elseif sellPanel then
+    sellPanel:Hide()
+  end
+end)
