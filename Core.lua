@@ -15,6 +15,7 @@ local WARN_AFTER = 5     -- warn if the AH hasn't answered in this long
 local QUOTE_TTL = 10     -- seconds a commodity price quote is trusted
 local MIN_QTY = 2        -- commodities: skip unless at least this many are under your max
 local BUY_PCT = 50       -- commodities: ask for this % of the cheap units, leaving room if others buy some
+local AH_CUT_PCT = 5     -- the auction house keeps 5% of each sale
 local MAX_PCT = 95       -- never ask for all of them: the last unit is bait you want left on the list
 
 local pending, sentAt, warned = false, 0, false
@@ -234,6 +235,7 @@ end
 local function Tally(id, won, qty, total)
   if not id or not DB then return end
   TallyTune(id, won, qty)
+  if won and qty and qty > 0 and total and wb_AHSnipe_LedgerBuy then wb_AHSnipe_LedgerBuy(id, qty, total) end
   DB.stats = DB.stats or {}
   for _, t in ipairs({ session, DB.stats }) do
     local r = t[id] or { won = 0, lost = 0, units = 0, spent = 0 }
@@ -408,8 +410,63 @@ local function IsFav(key)
   return v and true or false
 end
 
+-- How many sell per day across the region, from TSM's desktop app data
+-- (AuctionDB "DBRegionSoldPerDay"). nil when TSM or its data isn't there.
+local MIN_SOLD = 200
+local function SoldPerDay(id)
+  if not (id and TSM_API and TSM_API.GetCustomPriceValue) then return end
+  local ok, v = pcall(TSM_API.GetCustomPriceValue, "DBRegionSoldPerDay", "i:" .. id)
+  if ok and type(v) == "number" then return v end
+end
+
+-- Snipe skips items that sell fewer than Min sold/day (Setup; 0 = off).
+-- Items TSM has no number for are not blocked.
+local function SlowSeller(id)
+  local min = DB.minSold or MIN_SOLD
+  if min <= 0 then return end
+  local sold = SoldPerDay(id)
+  if sold and sold < min then return sold, min end
+end
+
+-- What buyers actually paid across the region (TSM "DBRegionSaleAvg", copper).
+local function SoldValue(id)
+  if not (id and TSM_API and TSM_API.GetCustomPriceValue) then return end
+  local ok, v = pcall(TSM_API.GetCustomPriceValue, "DBRegionSaleAvg", "i:" .. id)
+  if ok and type(v) == "number" and v > 0 then return v end
+end
+
+-- Buy ceiling: never pay more than Max % of TSM (Setup; default 90, 0 = off)
+-- of the sold value. Items without their own max use it as their max.
+local TSM_PCT, GAP_PCT = 90, 20
+local function Ceiling(id)
+  local pct = DB.tsmPct or TSM_PCT
+  if pct <= 0 then return end
+  local v = SoldValue(id)
+  return v and math.max(1, math.floor(v * pct / 100)) or nil
+end
+
+-- Your max for an item: its own max (or your default), lowered to the TSM
+-- ceiling when that's cheaper. With neither, the TSM ceiling alone.
 local function Cap(itemID)
-  return (itemID and DB.caps[itemID]) or DB.default
+  local own = (itemID and DB.caps[itemID]) or DB.default
+  local c = itemID and Ceiling(itemID)
+  if own and c then return math.min(own, c) end
+  return own or c
+end
+
+-- Resale gap: only buy units at least Gap % (Setup; default 20, 0 = off)
+-- under the next price tier above your max, which is about where you'd
+-- relist them. Returns the max to use for this list and that next tier.
+local function GapCap(itemID, cap)
+  local gap = DB.gapPct or GAP_PCT
+  if not cap or gap <= 0 then return cap end
+  for i = 1, C_AuctionHouse.GetNumCommoditySearchResults(itemID) or 0 do
+    local r = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, i)
+    if r and r.unitPrice > cap and r.quantity - (r.numOwnerItems or 0) > 0 then
+      return math.min(cap, math.floor(r.unitPrice * (100 - gap) / 100)), r.unitPrice
+    end
+  end
+  return cap
 end
 wb_AHSnipe_CapOf = Cap
 
@@ -483,7 +540,7 @@ local function Deals()
   local out = {}
   for _, r in ipairs(res or {}) do
     local id = r.itemKey and r.itemKey.itemID
-    local cap = id and IsFav(r.itemKey) and Cap(id)
+    local cap = id and IsFav(r.itemKey) and not SlowSeller(id) and Cap(id)
     if cap and r.minPrice and r.minPrice > 0 and r.minPrice <= cap then
       out[#out + 1] = { r = r, id = id, price = r.minPrice, cap = cap, score = (cap - r.minPrice) / cap }
     end
@@ -517,6 +574,7 @@ local function BuyItem(frame)
   local key = KeyOf(frame)
   if not key then msg("No item open.") return end
   if not IsFav(key) then L("press", { step = "not_fav", item = key.itemID }) return end
+  if SlowSeller(key.itemID) then L("press", { step = "slow_seller", item = key.itemID, sold = SoldPerDay(key.itemID) }) return end
 
   if Queued() then L("press", { step = "queued_wait", item = key.itemID }) return end
   if itemStale then
@@ -560,6 +618,7 @@ local function BuyCommodity()
   local itemID = OpenItemID()
   if not itemID then msg("No item open.") return end
   if not IsFav(OpenKey()) and not buying then L("press", { step = "not_fav", item = itemID }) return end
+  if SlowSeller(itemID) and not buying then L("press", { step = "slow_seller", item = itemID, sold = SoldPerDay(itemID) }) return end
   local cap = Cap(itemID)
   if not cap then SayOnce(itemID, "nomax", "No max set for " .. ItemText(itemID) .. ". Set one (per unit) in the AH Snipe window.") return end
 
@@ -616,7 +675,9 @@ local function BuyCommodity()
     return
   end
 
-  -- First press: count everything under the max.
+  -- First press: count everything under the max (lowered by the resale gap).
+  local fullCap, nextTier = cap, nil
+  cap, nextTier = GapCap(itemID, cap)
   local qty, total, gold = 0, 0, GetMoney()
   local n = C_AuctionHouse.GetNumCommoditySearchResults(itemID)
   if n == 0 and GetTime() - sentAt < 2 then
@@ -704,6 +765,7 @@ function wb_AHSnipe_Buy()
         if OpenDeal(d.r) then
           pending, sentAt = true, GetTime()
           L("jump", { item = d.id, price = d.price, cap = d.cap, deals = #deals, all = table.concat(list, " ") })
+          if DB.tick ~= false and wb_AHSnipe_PlayTick then wb_AHSnipe_PlayTick(d.id) end
           return
         end
         jumped, jumpAt, jumpPrice = nil, nil, nil
@@ -844,6 +906,10 @@ SlashCmdList.WBAHSNIPE = function(input)
     DB.monoChat = not (DB.monoChat ~= false)
     wb_AHSnipe_ApplyMono()
     msg("Monospace chat " .. (DB.monoChat ~= false and "on." or "off."))
+  elseif cmd == "profit" then
+    wb_AHSnipe_ProfitReport()
+  elseif cmd == "market" then
+    wb_AHSnipe_MarketReport()
   elseif cmd == "status" then
     msg("AH ready: " .. tostring(C_AuctionHouse.IsThrottledMessageSystemReady()) .. ", waiting on reply: " .. tostring(pending))
   else
@@ -1098,6 +1164,10 @@ local function NextPress()
   if id and not IsFav(OpenKey()) and not buying then
     return "Not in your favorites", "Snipe only buys favorites. Star it to snipe it.", "stop"
   end
+  local slowSold, slowMin = SlowSeller(id)
+  if id and slowSold and not buying then
+    return "Sells too slowly: " .. math.floor(slowSold + 0.5) .. " a day", "Min sold/day is " .. slowMin .. " (Setup).", "stop"
+  end
 
   if ah.CommoditiesBuyFrame and ah.CommoditiesBuyFrame:IsShown() and id then
     local cap = Cap(id)
@@ -1111,9 +1181,14 @@ local function NextPress()
         Coins(math.floor(quote.total / quote.qty + 0.5)) .. " each, max " .. Coins(cap), "go"
     end
     if staleID == id then return "Refresh", "The list changed after your last buy.", "idle" end
+    local fullCap, nextTier = cap, nil
+    cap, nextTier = GapCap(id, cap)
     local under, afford, cheapest, n = Under(id, cap)
     if n == 0 then return "Loading listings", "", "wait" end
     if under == 0 then
+      if cap < fullCap and cheapest and cheapest <= fullCap then
+        return "No resale gap: refresh", "Next tier " .. Coins(nextTier) .. ", so buys at " .. Coins(cap) .. " or less." .. BackIn(), "idle"
+      end
       return "Nothing under max: refresh", "Cheapest " .. (cheapest and Coins(cheapest) or "?") .. ", max " .. Coins(cap) .. "." .. BackIn(), "idle"
     end
     if afford == 0 then
@@ -1160,6 +1235,52 @@ local function NextPress()
 end
 wb_AHSnipe_NextPress = NextPress
 
+-- Jump sound: plays when Snipe opens a favorite that's under your max, so
+-- you know you've landed on a deal while you're spamming.
+-- Sounds to pick from on the Setup tab (name, SOUNDKIT key, id if the key is missing).
+local TICK_SOUNDS = {
+  { "Ping", "MAP_PING", 3175 },
+  { "Coins", "LOOT_WINDOW_COIN_SOUND", 120 },
+  { "Whisper", "TELL_MESSAGE", 3081 },
+  { "Raid warning", "RAID_WARNING", 8959 },
+  { "Soft click", "IG_MAINMENU_OPTION_CHECKBOX_ON", 856 },
+  { "Say item" }, -- text to speech: the item's name
+}
+function wb_AHSnipe_TickSound()
+  local t = TICK_SOUNDS[DB.tickSound or 1] or TICK_SOUNDS[1]
+  return t[1], (SOUNDKIT and SOUNDKIT[t[2]]) or t[3]
+end
+-- Text to speech, with the voice, speed and volume from the game's own
+-- text to speech options (its volume is separate from Master Volume).
+local function Speak(text)
+  if type(C_VoiceChat) ~= "table" or not C_VoiceChat.SpeakText then return false end
+  local voice, rate, volume = 0, 0, 100
+  if type(C_TTSSettings) == "table" then
+    if C_TTSSettings.GetVoiceOptionID and Enum and Enum.TtsVoiceType then
+      voice = C_TTSSettings.GetVoiceOptionID(Enum.TtsVoiceType.Standard) or 0
+    end
+    if C_TTSSettings.GetSpeechRate then rate = C_TTSSettings.GetSpeechRate() or rate end
+    if C_TTSSettings.GetSpeechVolume then volume = C_TTSSettings.GetSpeechVolume() or volume end
+  end
+  if C_VoiceChat.StopSpeakingText then pcall(C_VoiceChat.StopSpeakingText) end
+  return pcall(C_VoiceChat.SpeakText, voice, text, rate, volume)
+end
+
+function wb_AHSnipe_PlayTick(itemID)
+  local name, id = wb_AHSnipe_TickSound()
+  if id == nil then -- Say item
+    local text = itemID and (C_Item.GetItemNameByID(itemID) or (wb_AHSnipeLog.names and wb_AHSnipeLog.names[itemID])) or "Buy"
+    if Speak(text) then return end
+    id = (SOUNDKIT and SOUNDKIT.MAP_PING) or 3175 -- no text to speech: ping instead
+  end
+  PlaySound(id, "Master")
+end
+function wb_AHSnipe_NextTickSound()
+  DB.tickSound = (DB.tickSound or 1) % #TICK_SOUNDS + 1
+  wb_AHSnipe_PlayTick(OpenItemID())
+  return (wb_AHSnipe_TickSound())
+end
+
 local KIND_COLOR = {
   go = { 0.33, 1, 0.33 }, wait = { 1, 0.82, 0 }, idle = { 0.6, 0.6, 0.6 }, stop = { 1, 0.33, 0.33 },
 }
@@ -1174,7 +1295,7 @@ local function StatLine(label, r)
   return "|cffaaaaaa" .. label .. ":|r " .. color .. pct .. "%|r won |cff888888(" .. r.won .. " of " .. n .. ")|r" .. avg
 end
 
-local SNIPE_H, SETUP_H = 316, 290
+local SNIPE_H, SETUP_H = 384, 384
 
 -- Size the window for the tab that's showing.
 function wb_AHSnipe_Layout()
@@ -1199,7 +1320,7 @@ local function BuildSnipePage(p)
   -- The open item
   local card = CreateFrame("Frame", nil, p)
   card:SetPoint("TOPLEFT", p, "TOPLEFT", 0, -92)
-  card:SetSize(290, 186)
+  card:SetSize(290, 254)
   card.name = Text(card, "GameFontHighlightLarge", 14, -2, nil, 262)
   local maxLabel = Text(card, "GameFontNormal", 14, -26, "Max price")
   card.maxTag = card:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
@@ -1234,20 +1355,24 @@ local function BuildSnipePage(p)
 
   card.session = Text(card, "GameFontHighlightSmall", 14, -152, nil, 262)
   card.alltime = Text(card, "GameFontHighlightSmall", 14, -168, nil, 262)
+  card.market = Text(card, "GameFontHighlightSmall", 14, -188, nil, 262)
+  card.market2 = Text(card, "GameFontHighlightSmall", 14, -204, nil, 262)
+  card.sold = Text(card, "GameFontHighlightSmall", 14, -220, nil, 262)
+  card.profit = Text(card, "GameFontHighlightSmall", 14, -236, nil, 262)
   settings.card = card
 
   -- No item open: what's under max on your favorites
   local favs = CreateFrame("Frame", nil, p)
   favs:SetPoint("TOPLEFT", p, "TOPLEFT", 0, -92)
-  favs:SetSize(290, 186)
+  favs:SetSize(290, 254)
   favs.title = Text(favs, "GameFontNormal", 14, -2, "Favorites under your max")
   favs.lines = {}
-  for i = 1, 9 do favs.lines[i] = Text(favs, "GameFontHighlightSmall", 14, -10 - i * 17, nil, 262) end
+  for i = 1, 11 do favs.lines[i] = Text(favs, "GameFontHighlightSmall", 14, -10 - i * 17, nil, 262) end
   settings.favs = favs
 
   local roam = CreateFrame("CheckButton", "wb_AHSnipeRoam", p, "UICheckButtonTemplate")
   roam:SetSize(28, 28)
-  roam:SetPoint("TOPLEFT", p, "TOPLEFT", 12, -280)
+  roam:SetPoint("TOPLEFT", p, "TOPLEFT", 12, -348)
   local roamText = roam:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   roamText:SetPoint("LEFT", roam, "RIGHT", 4, 0)
   roamText:SetText("Jump in and out of favorites")
@@ -1290,8 +1415,59 @@ local function BuildSetupPage(p)
   ckBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
   settings.ckBox = ckBox
 
+  Text(p, "GameFontNormal", 198, -96, "Sold/day")
+  local soldBox = BigBox(p, "wb_AHSnipeMinSold", 76, true, 36, 16)
+  soldBox:SetMaxLetters(6)
+  soldBox:SetPoint("TOPLEFT", p, "TOPLEFT", 198, -112)
+  soldBox:SetScript("OnEnterPressed", function(self)
+    local n = tonumber(self:GetText())
+    if n and n >= 0 then
+      DB.minSold = n
+      msg(n > 0 and ("Only buys items that sell " .. n .. "+ a day (TSM region data).") or "Sold/day check off.")
+    end
+    self:ClearFocus()
+  end)
+  soldBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+  soldBox:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("Min sold per day")
+    GameTooltip:AddLine("Snipe skips items that sell fewer than this a day across the region, from TSM's desktop app data. 0 turns it off. Items TSM has no number for aren't blocked.", 1, 1, 1, true)
+    GameTooltip:Show()
+  end)
+  soldBox:SetScript("OnLeave", GameTooltip_Hide)
+  settings.soldBox = soldBox
+
+  local function PctBox(x, label, name, key, default, tip)
+    Text(p, "GameFontNormal", x, -160, label)
+    local b = BigBox(p, name, 66, true, 36, 16)
+    b:SetMaxLetters(3)
+    b:SetPoint("TOPLEFT", p, "TOPLEFT", x, -176)
+    b:SetScript("OnEnterPressed", function(self)
+      local n = tonumber(self:GetText())
+      if n and n >= 0 and n <= 100 then
+        DB[key] = n
+        msg(label .. ": " .. (n > 0 and (n .. "%") or "off"))
+      end
+      self:ClearFocus()
+    end)
+    b:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    b:SetScript("OnEnter", function(self)
+      GameTooltip:SetOwner(self, "ANCHOR_TOP")
+      GameTooltip:SetText(label)
+      GameTooltip:AddLine(tip, 1, 1, 1, true)
+      GameTooltip:Show()
+    end)
+    b:SetScript("OnLeave", GameTooltip_Hide)
+    b.key, b.default = key, default
+    return b
+  end
+  settings.tsmBox = PctBox(16, "Max % TSM", "wb_AHSnipeTsmPct", "tsmPct", TSM_PCT,
+    "Never pay more than this % of what buyers actually paid (TSM region sale average). Items without their own max use it as their max. 0 turns it off.")
+  settings.gapBox = PctBox(122, "Resale gap %", "wb_AHSnipeGapPct", "gapPct", GAP_PCT,
+    "Only buy units at least this % under the next price tier above your max, about where you'd relist them. 0 turns it off.")
+
   -- General Buy % and Explore share a box: Explore takes over Buy % while it's on.
-  local g = Group(p, 12, -160, 266, 72)
+  local g = Group(p, 12, -224, 266, 72)
   local pctLabel = Text(g, "GameFontNormal", 10, -8, "General Buy %")
   settings.pctTag = g:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
   settings.pctTag:SetPoint("LEFT", pctLabel, "RIGHT", 4, 0)
@@ -1326,16 +1502,38 @@ local function BuildSetupPage(p)
   end)
   settings.explore = explore
 
+  local tick = CreateFrame("CheckButton", "wb_AHSnipeTick", p, "UICheckButtonTemplate")
+  tick:SetSize(28, 28)
+  tick:SetPoint("TOPLEFT", p, "TOPLEFT", 12, -302)
+  local tickText = tick:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  tickText:SetPoint("LEFT", tick, "RIGHT", 4, 0)
+  tickText:SetText("Jump sound")
+  tick:SetChecked(DB.tick ~= false)
+  tick:SetScript("OnClick", function(self) DB.tick = self:GetChecked() and true or false end)
+  -- Click to hear the next sound; the one you stop on is kept.
+  local snd = CreateFrame("Button", nil, p, "UIPanelButtonTemplate")
+  snd:SetSize(84, 22)
+  snd:SetPoint("TOPRIGHT", p, "TOPRIGHT", -14, -305)
+  snd:SetText((wb_AHSnipe_TickSound()))
+  snd:SetScript("OnClick", function(self) self:SetText(wb_AHSnipe_NextTickSound()) end)
+  snd:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("Jump sound")
+    GameTooltip:AddLine("Click to hear the next sound. The one showing is the one you'll get.", 1, 1, 1, true)
+    GameTooltip:Show()
+  end)
+  snd:SetScript("OnLeave", GameTooltip_Hide)
+
   local checkBtn = CreateFrame("Button", "wb_AHSnipeCheckButton", p, "UIPanelButtonTemplate")
   checkBtn:SetSize(258, 28)
-  checkBtn:SetPoint("TOPLEFT", p, "TOPLEFT", 16, -246)
+  checkBtn:SetPoint("TOPLEFT", p, "TOPLEFT", 16, -340)
   checkBtn:SetText("Check prices")
   checkBtn:SetScript("OnClick", function() wb_AHSnipe_Check() end)
   settings.checkBtn = checkBtn
 
   local cancelBtn = CreateFrame("Button", "wb_AHSnipeCancelCheck", p, "UIPanelButtonTemplate")
   cancelBtn:SetSize(80, 28)
-  cancelBtn:SetPoint("TOPLEFT", p, "TOPLEFT", 16, -246)
+  cancelBtn:SetPoint("TOPLEFT", p, "TOPLEFT", 16, -340)
   cancelBtn:SetText("Cancel")
   cancelBtn:SetScript("OnClick", function() wb_AHSnipe_CancelCheck() end)
   cancelBtn:Hide()
@@ -1357,8 +1555,14 @@ local function UpdateSnipePage()
   if id then
     card.name:SetText(ItemText(id))
     local own = DB.caps[id]
-    card.maxTag:SetText(own and "for this item" or (DB.default and "using your default" or "none set"))
-    ShowMax(card.max, own or DB.default)
+    local set = own or DB.default
+    local eff = Cap(id)
+    if eff and (not set or eff < set) then
+      card.maxTag:SetText("|cff55ff55TSM " .. (DB.tsmPct or TSM_PCT) .. "%: " .. Coins(eff) .. "|r")
+    else
+      card.maxTag:SetText(own and "for this item" or (DB.default and "using your default" or "none set"))
+    end
+    ShowMax(card.max, set)
 
     local pct = card.pct
     if DB.explore then
@@ -1380,6 +1584,18 @@ local function UpdateSnipePage()
     end
     card.session:SetText(StatLine("This session", session[id]))
     card.alltime:SetText(StatLine("All-time", DB.stats and DB.stats[id]))
+    local m1, m2 = wb_AHSnipe_MarketLines(id)
+    card.market:SetText(m1)
+    card.market2:SetText(m2)
+    card.profit:SetText(wb_AHSnipe_ProfitLine(id))
+    local sold, min = SoldPerDay(id), DB.minSold or MIN_SOLD
+    if not sold then
+      card.sold:SetText("|cffaaaaaaSold/day:|r |cff888888no TSM data|r")
+    else
+      local ok = min <= 0 or sold >= min
+      card.sold:SetText("|cffaaaaaaSold/day:|r " .. (ok and "|cffffffff" or "|cffff5555") .. tostring(math.floor(sold + 0.5)) .. "|r"
+        .. (min > 0 and (" |cff888888(min " .. min .. ")|r") or "") .. " |cff888888TSM region|r")
+    end
   else
     local lines = favs.lines
     for i = 1, #lines do lines[i]:SetText("") end
@@ -1404,6 +1620,10 @@ local function UpdateSetupPage()
   ShowMax(settings.defMax, DB.default)
   if not settings.minBox:HasFocus() then settings.minBox:SetText(tostring(DB.minQty or MIN_QTY)) end
   if not settings.ckBox:HasFocus() then settings.ckBox:SetText(tostring(DB.checkPct or 70)) end
+  if not settings.soldBox:HasFocus() then settings.soldBox:SetText(tostring(DB.minSold or MIN_SOLD)) end
+  for _, b in ipairs({ settings.tsmBox, settings.gapBox }) do
+    if not b:HasFocus() then b:SetText(tostring(DB[b.key] or b.default)) end
+  end
   local pct = settings.genPct
   settings.explore:SetChecked(DB.explore and true or false)
   if DB.explore then
@@ -1468,6 +1688,46 @@ local function BuildBox()
   if PanelTemplates_SetNumTabs then pcall(PanelTemplates_SetNumTabs, settings, #tabs) end
   wb_AHSnipe_SelectTab(TAB.snipe)
 end
+
+-- Slow sellers in your favorites --------------------------------------------
+-- When your favorites list loads, say once which favorites sell fewer than
+-- your Sold/day (Snipe skips those) and which TSM has no number for (those
+-- aren't blocked). It speaks again only if the list or Sold/day changes.
+local slowSaid
+local function CheckSlowFavorites()
+  if lastBrowse ~= "fav" or not DB then return end
+  local min = DB.minSold or MIN_SOLD
+  if min <= 0 or not (TSM_API and TSM_API.GetCustomPriceValue) then return end
+  local slow, unknown, sig = {}, {}, { min }
+  for _, r in ipairs(C_AuctionHouse.GetBrowseResults() or {}) do
+    local id = r.itemKey and r.itemKey.itemID
+    if id and IsFav(r.itemKey) then
+      local sold = SoldPerDay(id)
+      if not sold then unknown[#unknown + 1] = id; sig[#sig + 1] = id .. "?"
+      elseif sold < min then slow[#slow + 1] = { id = id, sold = sold }; sig[#sig + 1] = id end
+    end
+  end
+  local key = table.concat(sig, ",")
+  if key == slowSaid then return end
+  slowSaid = key
+  if #slow == 0 and #unknown == 0 then return end
+  table.sort(slow, function(a, b) return a.sold < b.sold end)
+  if #slow > 0 then
+    local parts = {}
+    for _, x in ipairs(slow) do parts[#parts + 1] = ItemText(x.id) .. " |cffff5555" .. math.floor(x.sold + 0.5) .. "|r" end
+    msg("|cffffd100Skipping " .. #slow .. " slow " .. (#slow == 1 and "seller" or "sellers") .. "|r |cffaaaaaa(under " .. min .. " sold/day):|r " .. table.concat(parts, ", "))
+  end
+  if #unknown > 0 then
+    local parts = {}
+    for _, id in ipairs(unknown) do parts[#parts + 1] = ItemText(id) end
+    msg("|cffaaaaaaNo TSM sales data, so not checked:|r " .. table.concat(parts, ", "))
+  end
+  L("slow_favs", { min = min, slow = #slow, unknown = #unknown })
+end
+
+local sfw = CreateFrame("Frame")
+sfw:RegisterEvent("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+sfw:SetScript("OnEvent", function() pcall(CheckSlowFavorites) end)
 
 local ui = CreateFrame("Frame")
 ui:RegisterEvent("AUCTION_HOUSE_SHOW")
@@ -1836,12 +2096,339 @@ local function FloorFromItem(key)
   return prices[math.max(1, math.ceil(#prices * 0.25))], prices[1], #prices
 end
 
+-- Realized profit ------------------------------------------------------------
+-- Snipe keeps its own live ledger, so profit updates the moment it happens:
+--   buys:  every snipe you win (exact qty and price)
+--   sales: every "Auction successful" mail, read when you open the mailbox
+-- TSM's records (its saved data, as of your last /reload) fill in what the
+-- ledger can't see: everything from before the ledger started, and AH buys
+-- you made by hand. Each sale is matched to what you paid, oldest units
+-- first. Sales are after the AH's cut (the mail says exactly what it took).
+-- Units you didn't buy on the AH (farmed, crafted) have no cost and don't
+-- count as profit.
+local profitCache, tsmCache
+
+local function SplitCSV(line)
+  local t = {}
+  for f in (line .. ","):gmatch("([^,]*),") do t[#t + 1] = f end
+  return t
+end
+
+local function TSMRows(suffix)
+  local out, db = {}, TradeSkillMasterDB
+  if type(db) ~= "table" then return out end
+  for k, v in pairs(db) do
+    if type(k) == "string" and type(v) == "string" and k:sub(1, 2) == "r@" and k:sub(-#suffix) == suffix then
+      local head
+      for line in v:gmatch("[^\n]+") do
+        local f = SplitCSV(line)
+        if not head then
+          head = {}
+          for n, name in ipairs(f) do head[name] = n end
+        else
+          local id = tonumber((f[head.itemString or 0] or ""):match("^i:(%d+)"))
+          if id then
+            out[#out + 1] = {
+              id = id, qty = tonumber(f[head.quantity or 0]) or 0, price = tonumber(f[head.price or 0]) or 0,
+              ts = tonumber(f[head.time or 0]) or 0, source = f[head.source or 0],
+            }
+          end
+        end
+      end
+    end
+  end
+  return out
+end
+
+local function Ledger()
+  DB.ledger = DB.ledger or { start = time(), buys = {}, sales = {}, seen = {} }
+  return DB.ledger
+end
+
+function wb_AHSnipe_LedgerBuy(id, qty, total)
+  tinsert(Ledger().buys, { id = id, qty = qty, unit = total / qty, ts = time() })
+  profitCache = nil
+end
+
+-- Item ID from a name (mail only gives the name).
+local function IdFromName(name)
+  if not name then return end
+  for id, n in pairs(wb_AHSnipeLog and wb_AHSnipeLog.names or {}) do if n == name then return id end end
+  if C_Item and C_Item.GetItemInfoInstant then
+    local ok, id = pcall(C_Item.GetItemInfoInstant, name)
+    if ok and type(id) == "number" then return id end
+  end
+end
+
+-- Read every sale mail in the inbox. AH mail is kept 30 days, so the time it
+-- was sent is now minus (30 - days left). Each sale is counted once.
+local function ScanMail()
+  if not (DB and GetInboxNumItems and GetInboxInvoiceInfo) then return end
+  local led, added = Ledger(), 0
+  for i = 1, GetInboxNumItems() do
+    local info = { pcall(GetInboxInvoiceInfo, i) }
+    if info[1] and info[2] == "seller" then
+      local name, bid, consignment = info[3], info[5] or 0, info[8] or 0
+      local qty = tonumber(info[12]) or 1
+      local daysLeft = select(7, GetInboxHeaderInfo(i))
+      if name and bid > 0 and daysLeft then
+        local sent = math.floor(time() - (30 - daysLeft) * 86400)
+        local key = name .. "|" .. qty .. "|" .. bid .. "|" .. math.floor(sent / 600)
+        if not led.seen[key] then
+          led.seen[key] = sent
+          -- Sales sent before the ledger started are TSM's to report.
+          if sent >= led.start then
+            tinsert(led.sales, { name = name, id = IdFromName(name), qty = qty, net = bid - consignment, gross = bid, ts = sent })
+            added = added + 1
+          end
+        end
+      end
+    end
+  end
+  if added > 0 then
+    profitCache = nil
+    L("mail_sales", { added = added })
+  end
+end
+
+local mailFrame = CreateFrame("Frame")
+mailFrame:RegisterEvent("MAIL_INBOX_UPDATE")
+mailFrame:RegisterEvent("MAIL_SHOW")
+mailFrame:SetScript("OnEvent", function() pcall(ScanMail) end)
+
+local function BuildProfit()
+  local led = Ledger()
+  local start = led.start
+  if not tsmCache then
+    tsmCache = { buys = TSMRows("@internalData@csvBuys"), sales = TSMRows("@internalData@csvSales") }
+  end
+  local lots, sales = {}, {}
+  local function Lot(id, qty, unit, ts)
+    lots[id] = lots[id] or {}
+    tinsert(lots[id], { left = qty, unit = unit, ts = ts })
+  end
+  local function Sale(id, qty, net, ts)
+    sales[id] = sales[id] or {}
+    tinsert(sales[id], { qty = qty, net = net, ts = ts })
+  end
+  -- Ledger buys, plus TSM's: all before the ledger started, and after that
+  -- only ones that aren't a snipe already in the ledger (your buys by hand).
+  for _, b in ipairs(led.buys) do Lot(b.id, b.qty, b.unit, b.ts) end
+  for _, b in ipairs(tsmCache.buys) do
+    if b.source == "Auction" and b.qty > 0 then
+      local dup = false
+      if b.ts >= start then
+        for _, m in ipairs(led.buys) do
+          if m.id == b.id and m.qty == b.qty and math.abs(m.ts - b.ts) <= 120 then dup = true break end
+        end
+      end
+      if not dup then Lot(b.id, b.qty, b.price, b.ts) end
+    end
+  end
+  -- Ledger sales, plus TSM's from before the ledger started.
+  for _, x in ipairs(led.sales) do
+    x.id = x.id or IdFromName(x.name)
+    if x.id then Sale(x.id, x.qty, x.net, x.ts) end
+  end
+  for _, x in ipairs(tsmCache.sales) do
+    if x.source == "Auction" and x.qty > 0 and x.ts < start then
+      Sale(x.id, x.qty, x.price * x.qty, x.ts) -- TSM's sale prices are already after the cut
+    end
+  end
+
+  local byTime = function(a, b) return a.ts < b.ts end
+  local items, days, total = {}, {}, 0
+  for id, list in pairs(sales) do
+    table.sort(list, byTime)
+    local ls = lots[id] or {}
+    table.sort(ls, byTime)
+    local it = { sold = 0, matched = 0, cost = 0, profit = 0, held = 0 }
+    items[id] = it
+    for _, sale in ipairs(list) do
+      local netEach = sale.net / sale.qty
+      local need, cost, got = sale.qty, 0, 0
+      for _, lot in ipairs(ls) do
+        if need <= 0 then break end
+        if lot.left > 0 and lot.ts <= sale.ts + 60 then
+          local take = math.min(lot.left, need)
+          lot.left, need = lot.left - take, need - take
+          got, cost = got + take, cost + take * lot.unit
+          it.held = it.held + take * math.max(0, sale.ts - lot.ts) / 86400
+        end
+      end
+      it.sold = it.sold + sale.qty
+      if got > 0 then
+        local p = netEach * got - cost
+        it.matched, it.cost, it.profit = it.matched + got, it.cost + cost, it.profit + p
+        local d = date("%Y-%m-%d", sale.ts)
+        days[d] = (days[d] or 0) + p
+        total = total + p
+      end
+    end
+  end
+  for id, ls in pairs(lots) do
+    local it = items[id] or { sold = 0, matched = 0, cost = 0, profit = 0, held = 0 }
+    items[id] = it
+    local left = 0
+    for _, lot in ipairs(ls) do left = left + lot.left end
+    it.onHand = left
+  end
+  profitCache = { items = items, days = days, total = total }
+end
+
+function wb_AHSnipe_Profit(id)
+  if not profitCache then BuildProfit() end
+  return profitCache.items[id]
+end
+
+local function Signed(c)
+  c = math.floor(c + 0.5)
+  return (c < 0 and "|cffff5555-|r" or "|cff55ff55+|r") .. Coins(math.abs(c))
+end
+
+-- One line: "Profit: +81493 (43%) on 673 sold, 0.1d to sell"
+function wb_AHSnipe_ProfitLine(id)
+  local it = wb_AHSnipe_Profit(id)
+  if not it or it.sold == 0 then
+    return "|cffaaaaaaProfit:|r |cff888888none sold yet|r" .. ((it and (it.onHand or 0) > 0) and ("  |cff888888" .. it.onHand .. " on hand|r") or "")
+  end
+  if it.matched == 0 then return "|cffaaaaaaProfit:|r |cff888888" .. it.sold .. " sold, no AH buy cost on record|r" end
+  local pct = it.cost > 0 and math.floor(100 * it.profit / it.cost + 0.5) or 0
+  return "|cffaaaaaaProfit:|r " .. Signed(it.profit) .. " |cff888888(" .. pct .. "%) on " .. it.matched .. " sold, "
+    .. ("%.1f"):format(it.held / it.matched) .. "d to sell|r"
+end
+
+-- /snipe profit: total, the last 7 days, and the top items.
+function wb_AHSnipe_ProfitReport()
+  BuildProfit()
+  local c = profitCache
+  msg("|cffffd100Realized profit|r |cffaaaaaa(after the AH cut; live since " .. date("%b %d", Ledger().start) .. ", TSM before that):|r " .. Signed(c.total))
+  local line = {}
+  for k = 6, 0, -1 do
+    local d = date("%Y-%m-%d", time() - k * 86400)
+    line[#line + 1] = date("%a", time() - k * 86400) .. " " .. (c.days[d] and Signed(c.days[d]) or "|cff8888880|r")
+  end
+  msg("|cffaaaaaaLast 7 days:|r " .. table.concat(line, "  "))
+  local list = {}
+  for id, it in pairs(c.items) do if it.matched > 0 then list[#list + 1] = { id = id, it = it } end end
+  table.sort(list, function(a, b) return a.it.profit > b.it.profit end)
+  for k = 1, math.min(10, #list) do
+    local r = list[k]
+    msg(TruncateChars(ItemText(r.id), 20) .. "  " .. wb_AHSnipe_ProfitLine(r.id):gsub("^|cffaaaaaaProfit:|r ", ""))
+  end
+  if #list > 10 then msg("|cff888888...and " .. (#list - 10) .. " more items. Full list: profit_items.csv from the export.|r") end
+end
+
+-- Market price by hour -------------------------------------------------------
+-- Every time an item's listings load (sniping, price checks, anything), its
+-- market price is noted: the same "market" Check prices uses. At most one
+-- sample per item per 10 minutes goes into that hour's average, so a long
+-- snipe session doesn't outweigh the rest of the day.
+local MKT_EVERY = 600
+
+local function RecordMarket(id, market, cheapest, listed)
+  if not (id and market and DB) then return end
+  DB.mkt = DB.mkt or {}
+  local m = DB.mkt[id] or { h = {} }
+  DB.mkt[id] = m
+  local ts = time()
+  m.now, m.nowAt = market, ts
+  if m.at and ts - m.at < MKT_EVERY then return end
+  m.at = ts
+  local h = tonumber(date("%H"))
+  local b = m.h[h] or { n = 0, sum = 0 }
+  m.h[h] = b
+  b.n, b.sum = b.n + 1, b.sum + market
+  L("market", { item = id, market = market, cheapest = cheapest, listed = listed, hour = h })
+end
+
+local function HourText(h)
+  if h == 0 then return "12am" elseif h < 12 then return h .. "am" elseif h == 12 then return "12pm" end
+  return (h - 12) .. "pm"
+end
+
+-- usual = the average of each hour's average, so hours you play a lot don't
+-- count extra. Also the cheapest and priciest hours as a % of usual.
+function wb_AHSnipe_MarketInfo(id)
+  local m = DB and DB.mkt and DB.mkt[id]
+  if not m then return end
+  local avg, sum, hours = {}, 0, 0
+  for h, b in pairs(m.h) do
+    if b.n > 0 then avg[h] = b.sum / b.n; sum = sum + avg[h]; hours = hours + 1 end
+  end
+  local info = { now = m.now, nowAt = m.nowAt, hours = hours, avg = avg }
+  if hours == 0 then return info end
+  info.usual = sum / hours
+  for h, a in pairs(avg) do
+    if not info.lo or a < avg[info.lo] then info.lo = h end
+    if not info.hi or a > avg[info.hi] then info.hi = h end
+  end
+  info.loPct = math.floor(100 * avg[info.lo] / info.usual + 0.5)
+  info.hiPct = math.floor(100 * avg[info.hi] / info.usual + 0.5)
+  return info
+end
+
+local MKT_MIN_HOURS = 4 -- hours of data before naming a cheapest hour
+
+-- Two short lines for the Snipe tab's item card.
+function wb_AHSnipe_MarketLines(id)
+  local m = wb_AHSnipe_MarketInfo(id)
+  if not m or not m.now then return "|cffaaaaaaMarket:|r |cff888888no data yet|r", "" end
+  local line1 = "|cffaaaaaaMarket:|r " .. Coins(m.now) .. " now"
+  if m.usual then
+    local pct = math.floor(100 * m.now / m.usual + 0.5)
+    local color = pct <= 90 and "|cff55ff55" or pct >= 110 and "|cffff5555" or "|cffffffff"
+    line1 = line1 .. ", " .. color .. pct .. "%|r of usual (" .. Coins(m.usual) .. ")"
+  end
+  local line2
+  if m.hours < MKT_MIN_HOURS then
+    line2 = "|cff888888Learning the day: " .. m.hours .. " of 24 hours seen.|r"
+  else
+    line2 = "|cffaaaaaaLowest|r " .. HourText(m.lo) .. " |cff55ff55" .. m.loPct .. "%|r"
+      .. "  |cffaaaaaahighest|r " .. HourText(m.hi) .. " |cffff5555" .. m.hiPct .. "%|r"
+      .. "  |cff888888(" .. m.hours .. "h seen)|r"
+  end
+  return line1, line2
+end
+
+-- /snipe market: one line per item, cheapest hour first.
+function wb_AHSnipe_MarketReport()
+  local list = {}
+  for id in pairs(DB.mkt or {}) do
+    local m = wb_AHSnipe_MarketInfo(id)
+    if m and m.usual then list[#list + 1] = { id = id, m = m } end
+  end
+  if #list == 0 then msg("No market data yet. It builds up as item lists load.") return end
+  table.sort(list, function(a, b) return (a.m.loPct or 100) < (b.m.loPct or 100) end)
+  msg("|cffffd100Market by hour|r |cffaaaaaa(usual = average across the hours seen)|r")
+  for _, r in ipairs(list) do
+    local m = r.m
+    local t = TruncateChars(ItemText(r.id), 20) .. "  usual " .. Coins(m.usual)
+    if m.hours >= MKT_MIN_HOURS then
+      t = t .. "  low " .. HourText(m.lo) .. " |cff55ff55" .. m.loPct .. "%|r  high " .. HourText(m.hi) .. " |cffff5555" .. m.hiPct .. "%|r"
+    end
+    msg(t .. "  |cff888888" .. m.hours .. "h|r")
+  end
+end
+
+local mf = CreateFrame("Frame")
+mf:RegisterEvent("COMMODITY_SEARCH_RESULTS_UPDATED")
+mf:RegisterEvent("ITEM_SEARCH_RESULTS_UPDATED")
+mf:SetScript("OnEvent", function(_, e, a1)
+  if not DB or not a1 then return end
+  if e == "COMMODITY_SEARCH_RESULTS_UPDATED" then
+    RecordMarket(a1, FloorFromCommodity(a1))
+  elseif type(a1) == "table" and a1.itemID then
+    RecordMarket(a1.itemID, FloorFromItem(a1))
+  end
+end)
+
 local function ShowCheckPanel()
   if not lastCheck or not settings then return end
   local page = settings.pages[3]
   if not checkPanel then
     checkPanel = CreateFrame("Frame", nil, page)
-    checkPanel:SetPoint("TOPLEFT", page, "TOPLEFT", 0, -284)
+    checkPanel:SetPoint("TOPLEFT", page, "TOPLEFT", 0, -378)
     checkPanel:SetPoint("RIGHT", page, "RIGHT", 0, 0)
     checkPanel.title = checkPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     checkPanel.title:SetPoint("TOPLEFT", 14, 0)
@@ -1938,12 +2525,12 @@ local function CheckButtons(running)
   if running then
     c:Show()
     b:SetSize(174, 28)
-    b:SetPoint("TOPLEFT", settings.pages[3], "TOPLEFT", 100, -246)
+    b:SetPoint("TOPLEFT", settings.pages[3], "TOPLEFT", 100, -340)
     wb_AHSnipe_SelectTab(3)
   else
     c:Hide()
     b:SetSize(258, 28)
-    b:SetPoint("TOPLEFT", settings.pages[3], "TOPLEFT", 16, -246)
+    b:SetPoint("TOPLEFT", settings.pages[3], "TOPLEFT", 16, -340)
     b:SetText("Check prices")
   end
 end
@@ -2482,7 +3069,7 @@ function wb_AHSnipe_TuneWindow() wb_AHSnipe_SelectTab(4) end
 -- (this session and all-time) with the price you're about to post at, after
 -- the auction house's 5% cut.
 
-local AH_CUT = 0.05
+local AH_CUT = AH_CUT_PCT / 100
 local sellPanel
 
 local function SellFrame()
@@ -2541,6 +3128,7 @@ local function BuildSellPanel()
   sellPanel.item = Line("GameFontHighlightLarge", 0)
   sellPanel.session = Labeled("Bought this session")
   sellPanel.alltime = Labeled("Bought all-time")
+  sellPanel.realized = Labeled("Sold so far")
   sellPanel.selling = Labeled("Selling at")
   sellPanel.profit = Line("GameFontHighlightLarge", 12)
 end
@@ -2557,7 +3145,7 @@ local function UpdateSellPanel()
   for _, l in ipairs(sellPanel.labels) do l:SetShown(id and true or false) end
   if not id then
     sellPanel.item:SetText("|cffaaaaaaPut an item in the AH's Sell slot to compare what you paid with your price.|r")
-    for _, k in ipairs({ "session", "alltime", "selling", "profit" }) do sellPanel[k]:SetText("") end
+    for _, k in ipairs({ "session", "alltime", "realized", "selling", "profit" }) do sellPanel[k]:SetText("") end
   else
     local s, a = session[id], DB.stats and DB.stats[id]
     local sAvg, aAvg = Avg(s), Avg(a)
@@ -2565,6 +3153,7 @@ local function UpdateSellPanel()
     sellPanel.session:SetText(sAvg and (s.units .. " at " .. Coins(sAvg) .. " avg  |cffaaaaaa(" .. Coins(s.spent) .. ")|r")
       or "|cff888888none|r")
     sellPanel.alltime:SetText(aAvg and (a.units .. " at " .. Coins(aAvg) .. " avg") or "|cff888888none|r")
+    sellPanel.realized:SetText((wb_AHSnipe_ProfitLine(id):gsub("^|cffaaaaaaProfit:|r ", "")))
 
     local price, qty = SellPrice(f), SellQty(f)
     if not price then

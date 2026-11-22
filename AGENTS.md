@@ -51,8 +51,12 @@ One window to the right of the AH, with four tabs. It follows the AH: the AH's S
 
 **Next press** (`NextPress()`, also `wb_AHSnipe_NextPress`) mirrors the Snipe key's decisions without sending anything: buy, quote, jump, bait, nothing under max, can't afford, no max, waiting for the server, price check running, or the price reminder. Its border is green (will buy or jump), yellow (waiting), gray (will refresh) or red (blocked). **When you change what the Snipe key decides, you change `NextPress()` the same way**, or the window will say one thing and the key will do another.
 
+**Jump sound:** when the Snipe key jumps from favorites into a deal, `wb_AHSnipe_PlayTick(itemID)` plays the chosen sound (`DB.tickSound`, Ping by default) or speaks the item name with `C_VoiceChat.SpeakText` (falls back to Ping). Setup has the on/off checkbox (`DB.tick`) and a button that cycles and previews the sounds.
+
 ### Settings
-- **Max price** (gold/silver/copper): saved per item in `DB.caps[itemID]` from the Snipe tab's card, or as `DB.default` from Setup. Everything that asks "is this a deal?" calls `Cap(itemID)`.
+- **Max price** (gold/silver/copper): saved per item in `DB.caps[itemID]` from the Snipe tab's card, or as `DB.default` from Setup. Everything that asks "is this a deal?" calls `Cap(itemID)`, which is the item's own max (or the default) **lowered to the TSM ceiling** when that's cheaper, or the TSM ceiling alone when neither is set.
+- **Max % TSM** (`DB.tsmPct`, default 90, 0 = off): the TSM ceiling is this % of TSM's region sale average (`DBRegionSaleAvg`, what buyers actually paid). `Ceiling()` computes it.
+- **Resale gap %** (`DB.gapPct`, default 20, 0 = off): `GapCap()` finds the first listing priced above the max (the next tier, about where you'd relist) and lowers the max for this list to that price minus the gap. The buy and `NextPress()` both apply it ("No resale gap: refresh").
 - **Min qty** (`DB.minQty`): commodity buys skip unless at least this many units are under max. This is the bait filter.
 - **Buy %**: the share of cheap units each commodity quote asks for, so another buyer taking a few doesn't sink the whole purchase. `DB.itemPct[itemID]` (Snipe tab card) if set, else `DB.buyPct` (Setup). `PickPct()` decides which applies. It tops out at 95% (`MAX_PCT`), and a buy always leaves at least 1 cheap unit, so bait is never bought.
 - **Explore** (`DB.explore`, Setup): sits in a box with the general Buy % because it takes it over. While on, both Buy % inputs are locked and `PickPct()` rotates 35/50/66/85%, least-tested first. It keeps its pick for an item until that attempt finishes, so the % the window shows is the % the key uses.
@@ -60,6 +64,15 @@ One window to the right of the AH, with four tabs. It follows the AH: the AH's S
 
 ### Price check (`wb_AHSnipe_Check`)
 One click loads favorites if needed, then searches every favorite in turn from a driver frame, waiting for the AH between searches. For each item it computes **market**: the price reached after the cheapest 10% of units (at least 5), so bait can't drag it down; for single items, the 25th percentile buyout. Suggested max = market × Check %. Results show under the button on the Setup tab (scrolling list, Set per row, Apply all), are logged as `price_check` rows, and set `DB.lastCheckAt`.
+
+### Sold per day (TSM)
+`SoldPerDay(id)` reads TSM's region sold-per-day (`TSM_API.GetCustomPriceValue("DBRegionSoldPerDay", "i:<id>")`, from the TSM desktop app's AppHelper data). `SlowSeller(id)` blocks buying, jumping and the Next press line when it's under **Min sold/day** (`DB.minSold`, default 200, Setup tab; 0 = off). Items TSM has no number for are not blocked, and nothing breaks if TSM isn't installed. The item card shows the number. When the favorites list loads, `CheckSlowFavorites()` prints once which favorites are under Sold/day (skipped) and which have no TSM number; it speaks again only when that list or Sold/day changes.
+
+### Realized profit (live ledger + TSM history)
+Snipe keeps its own ledger in `DB.ledger` (started the first time it runs, `start`): every won snipe goes in from `Tally()` via `wb_AHSnipe_LedgerBuy`, and every "Auction successful" mail goes in when the mailbox opens (`ScanMail()` on `MAIL_SHOW` / `MAIL_INBOX_UPDATE`, from `GetInboxInvoiceInfo`: sale minus the AH cut, sent time = now minus (30 minus days left), each mail counted once via `seen`). TSM's saved records (`TradeSkillMasterDB["r@<realm>@internalData@csvSales"]` and `csvBuys`; **sale prices are already after the cut**, per unit) fill in what the ledger can't see: everything before `start`, and AH buys made by hand after it (TSM buys that don't match a ledger snipe by item, qty and 2 minutes). `BuildProfit()` matches sales to buys oldest-first. Units with no AH buy (farmed, crafted) don't count. The Snipe tab's item card and the Sell tab show it per item; `/snipe profit` prints the total, the last 7 days and the top items. `tools/export.py` does the TSM-only version offline (`profit.csv`, `profit_items.csv`, `profit_daily.csv`), so it reflects TSM's last save.
+
+### Market price by hour
+Whenever an item's listings load (sniping, jumping, price checks), `RecordMarket()` notes its market price (same math as Price check). At most one sample per item per 10 minutes goes into `DB.mkt[id].h[hour]`, so a long session doesn't outweigh the rest of the day; `m.now` always holds the latest. Usual = the average of the hour averages. The Snipe tab's item card shows market now as a % of usual, and after 4 hours of data, the cheapest and priciest hours. `/snipe market` lists every item, cheapest hour first. Each sample is logged as a `market` row and exported to `market.csv`.
 
 ### Stale price reminder
 Every time the AH opens, if `DB.lastCheckAt` is 1+ hour old (or missing), a popup offers Check prices. Until the user answers, the Snipe key won't buy. It exists because the user once bought a lot at stale maxes.

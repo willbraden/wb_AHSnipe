@@ -8,6 +8,12 @@ winrates.csv   win rate by item, Buy %, hour, weekday and cheap units listed,
                rebuilt from all of purchases.csv each run
 deals.csv      favorites dips at or under your max, how long they lasted,
                and whether you bought during the dip
+profit.csv     every AH sale (from TSM's records) matched to what you paid,
+               oldest units first, with profit after the AH cut and days held
+profit_items.csv  profit, margin, days to sell and units on hand per item
+profit_daily.csv  realized profit per day
+market.csv     each item's market price over time (at most one sample per item
+               per 10 minutes), with the hour of day, for charting by hour
 
 Run it after a /reload. New rows are added; rows already in the CSVs are skipped.
 Usage: python export.py <path to WTF/Account/<ACCOUNT>/SavedVariables/wb_AHSnipe.lua>
@@ -237,6 +243,22 @@ for r in rows:
         "key": f"{int(ts)}-{i}",
     })
 
+# -------------------------------------------------------------------- market
+M_COLS = ["date", "time", "hour", "weekday", "item", "item_id", "market", "cheapest", "listed",
+          "market_copper", "cheapest_copper", "key"]
+markets = []
+for r in rows:
+    if r["e"] != "market":
+        continue
+    ts = real(r); d, t = stamp(ts); i = r.get("item")
+    dt = datetime.datetime.fromtimestamp(ts, TZ)
+    markets.append({
+        "date": d, "time": t, "hour": dt.hour, "weekday": dt.strftime("%a"), "item": name(i), "item_id": i,
+        "market": gsc(r.get("market")), "cheapest": gsc(r.get("cheapest")), "listed": r.get("listed", ""),
+        "market_copper": r.get("market", ""), "cheapest_copper": r.get("cheapest", ""),
+        "key": f"{int(ts)}-{i}",
+    })
+
 n1 = append("purchases.csv", P_COLS, purchases)
 n2 = append("deals.csv", D_COLS, deals)
 print(f"purchases.csv: +{n1} rows ({len(purchases)} in this log)")
@@ -244,6 +266,8 @@ print(f"deals.csv: +{n2} rows ({len(deals)} in this log)")
 n3 = append("prices.csv", C_COLS, checks)
 print(f"prices.csv: +{n3} rows ({len(checks)} in this log)")
 print(f"bait.csv: {len(bait_rows)} bait listings (rebuilt)")
+n4 = append("market.csv", M_COLS, markets)
+print(f"market.csv: +{n4} rows ({len(markets)} in this log)")
 
 
 # ------------------------------------------------------------------ winrates
@@ -283,3 +307,146 @@ for (dim, item, bucket), g in sorted(groups.items()):
 with open(os.path.join(HERE, "winrates.csv"), "w", newline="", encoding="utf-8") as fh:
     w = csv.DictWriter(fh, fieldnames=W_COLS); w.writeheader(); w.writerows(wrows)
 print(f"winrates.csv: {len(wrows)} rows from {len(hist)} purchase attempts (rebuilt)")
+
+
+# -------------------------------------------------------------------- profit
+# Realized profit from TSM's own sales and buys records (TSM Accounting,
+# which reads your AH mail). Each sale is matched to what you paid using
+# first-in, first-out: the oldest units you bought are the first ones sold.
+# TSM stores sale prices after the AH's cut (sale minus cut, per unit).
+TSM_SV = os.path.join(os.path.dirname(os.path.abspath(SV)), "TradeSkillMaster.lua")
+
+def tsm_rows(db, suffix):
+    out = []
+    for k in db.keys():
+        if not (isinstance(k, str) and k.startswith("r@") and k.endswith("@internalData@" + suffix)):
+            continue
+        lines = (db[k] or "").split("\n")
+        if not lines:
+            continue
+        head = lines[0].split(",")
+        for line in lines[1:]:
+            if not line:
+                continue
+            parts = line.split(",")
+            if len(parts) != len(head):
+                continue
+            r = dict(zip(head, parts))
+            m = re.match(r"i:(\d+)", r.get("itemString", ""))
+            if not m:
+                continue
+            r["id"] = int(m.group(1))
+            r["qty"] = int(r.get("quantity") or 0)
+            r["ts"] = int(r.get("time") or 0)
+            if "price" in r:
+                r["price"] = int(r["price"] or 0)
+            out.append(r)
+    return out
+
+if os.path.exists(TSM_SV):
+    T = lupa.LuaRuntime()
+    T.execute(open(TSM_SV, encoding="utf-8", errors="replace").read())
+    tdb = T.globals().TradeSkillMasterDB
+    t_sales = [r for r in tsm_rows(tdb, "csvSales") if r.get("source") == "Auction"]
+    t_buys = [r for r in tsm_rows(tdb, "csvBuys") if r.get("source") == "Auction"]
+    t_expired = tsm_rows(tdb, "csvExpired")
+
+    # Which buys were snipes: same item and qty in purchases.csv within 2 minutes.
+    snipes = {}
+    for p in hist:
+        if p.get("result") != "bought":
+            continue
+        try:
+            ts = datetime.datetime.strptime(p["date"] + " " + p["time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ).timestamp()
+            snipes.setdefault((int(p["item_id"]), int(p["qty"])), []).append(ts)
+        except (KeyError, ValueError):
+            pass
+    def is_snipe(b):
+        return any(abs(t - b["ts"]) <= 120 for t in snipes.get((b["id"], b["qty"]), []))
+
+    lots = {}
+    for b in sorted(t_buys, key=lambda r: r["ts"]):
+        lots.setdefault(b["id"], []).append({"qty": b["qty"], "left": b["qty"], "unit": b["price"], "ts": b["ts"], "snipe": is_snipe(b)})
+
+    sale_rows, item_sum, day_sum = [], {}, {}
+    for s_ in sorted(t_sales, key=lambda r: r["ts"]):
+        i, q, ts = s_["id"], s_["qty"], s_["ts"]
+        net_each = s_["price"]
+        cost, matched, snipe_q, held = 0, 0, 0, 0.0
+        for lot in lots.get(i, []):
+            if matched >= q:
+                break
+            if lot["left"] <= 0 or lot["ts"] > ts:
+                continue
+            take = min(lot["left"], q - matched)
+            lot["left"] -= take
+            matched += take
+            cost += take * lot["unit"]
+            held += take * (ts - lot["ts"]) / 86400
+            if lot["snipe"]:
+                snipe_q += take
+        d, t = stamp(ts)
+        profit = net_each * matched - cost if matched else None
+        sale_rows.append({
+            "date": d, "time": t, "item": name(i), "item_id": i, "qty": q,
+            "sell_each": gsc(s_["price"]), "net_each": gsc(net_each),
+            "cost_each": gsc(cost / matched) if matched else "",
+            "profit": gsc(profit) if profit is not None and profit >= 0 else ("-" + gsc(-profit) if profit is not None else ""),
+            "profit_copper": round(profit) if profit is not None else "",
+            "profit_pct": round(100 * (net_each * matched - cost) / cost) if matched and cost else "",
+            "days_held": round(held / matched, 1) if matched else "",
+            "matched_qty": matched, "snipe_qty": snipe_q, "buyer": s_.get("otherPlayer", ""),
+        })
+        it = item_sum.setdefault(i, {"sold": 0, "rev": 0.0, "cost": 0, "matched": 0, "profit": 0.0, "held": 0.0, "last": ""})
+        it["sold"] += q; it["rev"] += net_each * q; it["matched"] += matched; it["cost"] += cost
+        it["held"] += held; it["last"] = f"{d} {t}"
+        if matched:
+            it["profit"] += net_each * matched - cost
+            dd = day_sum.setdefault(d, {"rev": 0.0, "cost": 0, "profit": 0.0, "units": 0})
+            dd["rev"] += net_each * matched; dd["cost"] += cost; dd["profit"] += net_each * matched - cost; dd["units"] += matched
+
+    expired = {}
+    for e in t_expired:
+        expired[e["id"]] = expired.get(e["id"], 0) + e["qty"]
+
+    PS_COLS = ["date", "time", "item", "item_id", "qty", "sell_each", "net_each", "cost_each", "profit",
+               "profit_copper", "profit_pct", "days_held", "matched_qty", "snipe_qty", "buyer"]
+    with open(os.path.join(HERE, "profit.csv"), "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=PS_COLS); w.writeheader(); w.writerows(sale_rows)
+
+    PI_COLS = ["item", "item_id", "bought_units", "spent", "sold_units", "revenue_net", "cost_of_sold", "profit",
+               "profit_copper", "margin_pct", "avg_days_to_sell", "on_hand_units", "on_hand_cost",
+               "snipe_units_bought", "expired_units", "last_sale"]
+    irows = []
+    for i in set(lots) | set(item_sum):
+        bl = lots.get(i, [])
+        it = item_sum.get(i, {"sold": 0, "rev": 0, "cost": 0, "matched": 0, "profit": 0, "held": 0, "last": ""})
+        on_hand = sum(l["left"] for l in bl)
+        irows.append({
+            "item": name(i), "item_id": i,
+            "bought_units": sum(l["qty"] for l in bl), "spent": gsc(sum(l["qty"] * l["unit"] for l in bl)),
+            "sold_units": it["sold"], "revenue_net": gsc(it["rev"]), "cost_of_sold": gsc(it["cost"]),
+            "profit": (gsc(it["profit"]) if it["profit"] >= 0 else "-" + gsc(-it["profit"])) if it["matched"] else "",
+            "profit_copper": round(it["profit"]) if it["matched"] else "",
+            "margin_pct": round(100 * it["profit"] / it["cost"]) if it["cost"] else "",
+            "avg_days_to_sell": round(it["held"] / it["matched"], 1) if it["matched"] else "",
+            "on_hand_units": on_hand, "on_hand_cost": gsc(sum(l["left"] * l["unit"] for l in bl)),
+            "snipe_units_bought": sum(l["qty"] for l in bl if l["snipe"]),
+            "expired_units": expired.get(i, 0), "last_sale": it["last"],
+        })
+    irows.sort(key=lambda r: -(r["profit_copper"] or 0))
+    with open(os.path.join(HERE, "profit_items.csv"), "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=PI_COLS); w.writeheader(); w.writerows(irows)
+
+    PD_COLS = ["date", "units_sold", "revenue_net", "cost", "profit", "profit_copper"]
+    drows = [{"date": d, "units_sold": v["units"], "revenue_net": gsc(v["rev"]), "cost": gsc(v["cost"]),
+              "profit": gsc(v["profit"]) if v["profit"] >= 0 else "-" + gsc(-v["profit"]),
+              "profit_copper": round(v["profit"])} for d, v in sorted(day_sum.items())]
+    with open(os.path.join(HERE, "profit_daily.csv"), "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=PD_COLS); w.writeheader(); w.writerows(drows)
+
+    total = sum(v["profit"] for v in day_sum.values())
+    print(f"profit.csv: {len(sale_rows)} AH sales from TSM, profit_items.csv: {len(irows)} items, "
+          f"profit_daily.csv: {len(drows)} days (rebuilt). Realized profit: {gsc(total) if total >= 0 else '-' + gsc(-total)}")
+else:
+    print("profit: TSM's saved data not found next to wb_AHSnipe.lua, skipped")
