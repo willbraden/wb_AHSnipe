@@ -5,6 +5,8 @@ A World of Warcraft: Forever addon for fast auction house sniping with the stock
 ## Features
 
 - **One-button snipe.** Each press does the next step: refresh, quote, confirm, then refresh again after a buy.
+- **Post your own bait (experiment).** Check **Bait** on the Snipe tab's item card and Snipe keeps 1 of that item listed at your max, posting it on a press that would otherwise just refresh. Sellers who undercut the lowest price then post under it, where you can snipe them. Needs the item in your bags; at most once a minute and 10 times per item per session.
+- **Stay on an item.** Check **Stay** on the Snipe tab's item card (or `/snipe stay`) and Snipe won't jump back to favorites from that item until you uncheck it.
 - **Jump sound.** Plays when Snipe jumps from your favorites into an item that's under your max. Pick the sound (Ping, Coins, Whisper, Raid warning, Soft click, or Say item, which speaks the item name with the game's text to speech) or turn it off on the Setup tab.
 - **Profit on every buy.** Each Bought line shows what that buy should make when you resell it (at TSM's sale average, after the AH cut) and your expected gold per hour and total so far this session, counting only time the AH is open.
 - **Next press line.** The AH Snipe window says what your next press will do and why: buy, quote, jump to a deal, bait, nothing under max, can't afford, waiting for the server. Green means it will buy or jump, gray means it will refresh, red means something is blocking it.

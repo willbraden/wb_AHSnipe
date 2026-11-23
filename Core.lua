@@ -597,7 +597,8 @@ end
 
 local function OverMax(itemID)
   overCount = overCount + 1
-  if overCount >= BackLimit() and lastBrowse == "fav" and DB.roam ~= false then
+  if overCount >= BackLimit() and lastBrowse == "fav" and DB.roam ~= false and DB.pin ~= itemID
+     and not (DB.baitOn and DB.baitOn[itemID]) then
     L("auto_back", { item = itemID, presses = overCount, empty = sawUnder and 0 or 1 })
     overCount = 0
     wb_AHSnipe_Favorites()
@@ -648,6 +649,77 @@ end
 -- afford) and ask the server for a quote on that amount.
 -- Press 2: buy it, if the quote still fits under your max.
 -- If the list is out of date, a press refreshes it instead.
+
+-- Your own bait ---------------------------------------------------------------
+-- An experiment: keep 1 unit of an item listed at your max, so sellers who
+-- undercut the lowest listing post their stacks just under it, where you can
+-- snipe them. Posting needs a key press, so it's one of the things a Snipe
+-- press does: only when that press would otherwise just refresh, nothing else
+-- is waiting at the AH, and no one's listing is already at or under your
+-- price. Turned on per item with the Bait checkbox on the Snipe tab.
+do
+  local BAIT_EVERY = 60  -- seconds between posts of the same item
+  local BAIT_MAX = 10    -- posts per item per session, to cap the cost
+  local lastPost, posts = {}, {}
+
+  -- First bag slot holding this item.
+  local function FindInBags(id)
+    local C = C_Container
+    for bag = 0, 4 do
+      local n = (C and C.GetContainerNumSlots or GetContainerNumSlots)(bag) or 0
+      for slot = 1, n do
+        local sid = (C and C.GetContainerItemID or GetContainerItemID)(bag, slot)
+        if sid == id then return bag, slot end
+      end
+    end
+  end
+
+  -- Lowest listing at all, and whether one of yours is at or under the price.
+  local function Lowest(id, price)
+    local low, mine = nil, false
+    for i = 1, C_AuctionHouse.GetNumCommoditySearchResults(id) or 0 do
+      local r = C_AuctionHouse.GetCommoditySearchResultInfo(id, i)
+      if not r then break end
+      if not low then low = r.unitPrice end
+      if r.unitPrice > price then break end
+      if (r.numOwnerItems or 0) > 0 then mine = true end
+    end
+    return low, mine
+  end
+
+  -- What bait would do on this press: nil (off), or a status table.
+  function wb_AHSnipe_BaitStatus(id, cap)
+    if not (id and cap and DB.baitOn and DB.baitOn[id]) then return end
+    local low, mine = Lowest(id, cap)
+    local st = { price = cap, mine = mine, low = low, posts = posts[id] or 0 }
+    if mine then st.state = "listed"
+    elseif low and low <= cap then st.state = "covered" -- someone else's listing is already that low
+    elseif (posts[id] or 0) >= BAIT_MAX then st.state = "limit"
+    elseif lastPost[id] and GetTime() - lastPost[id] < BAIT_EVERY then st.state = "wait"; st.inSec = math.ceil(BAIT_EVERY - (GetTime() - lastPost[id]))
+    elseif not FindInBags(id) then st.state = "nobags"
+    else st.state = "post" end
+    return st
+  end
+
+  -- Called from a Snipe press that would otherwise refresh. Returns true if it posted.
+  function wb_AHSnipe_TryBait(id, cap)
+    local st = wb_AHSnipe_BaitStatus(id, cap)
+    if not st or st.state ~= "post" then return false end
+    if not (C_AuctionHouse.PostCommodity and ItemLocation and ItemLocation.CreateFromBagAndSlot) then return false end
+    local bag, slot = FindInBags(id)
+    local loc = ItemLocation:CreateFromBagAndSlot(bag, slot)
+    local ok, err = pcall(C_AuctionHouse.PostCommodity, loc, 1, 1, cap) -- 12h, 1 unit, at your max
+    lastPost[id] = GetTime()
+    if not ok then
+      L("bait_error", { item = id, err = tostring(err) })
+      return false
+    end
+    posts[id] = (posts[id] or 0) + 1
+    L("bait_post", { item = id, price = cap, n = posts[id] })
+    msg("Posted bait: 1 " .. ItemText(id) .. " at " .. Coins(cap) .. " |cff888888(" .. posts[id] .. " of " .. BAIT_MAX .. " this session)|r")
+    return true
+  end
+end
 
 local function BuyCommodity()
   local itemID = OpenItemID()
@@ -732,6 +804,10 @@ local function BuyCommodity()
   end
   local listAge = ms(now - (resultsAt[itemID] or now))
 
+  if qty == 0 and not pending and wb_AHSnipe_TryBait(itemID, cap) then
+    L("press", { step = "bait_posted", item = itemID })
+    return
+  end
   if qty == 0 then
     if OverMax(itemID) then return end
     local r = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, 1)
@@ -742,6 +818,10 @@ local function BuyCommodity()
 
   local minQty = math.max(2, DB.minQty or MIN_QTY) -- 1 cheap unit is always bait
   local baitBuy = false
+  if qty < minQty and not pending and wb_AHSnipe_TryBait(itemID, cap) then
+    L("press", { step = "bait_posted", item = itemID })
+    return
+  end
   if qty < minQty then
     overCount = 0 -- bait under max: stay parked
     baitPresses = baitPresses + 1
@@ -997,6 +1077,15 @@ SlashCmdList.WBAHSNIPE = function(input)
     msg("Monospace chat " .. (DB.monoChat ~= false and "on." or "off."))
   elseif cmd == "profit" then
     wb_AHSnipe_ProfitReport()
+  elseif cmd == "stay" or cmd == "pin" then
+    local id = OpenItemID()
+    if DB.pin and (not id or DB.pin == id) then
+      DB.pin = nil; msg("Stay off: Snipe can go back to favorites again.")
+    elseif id then
+      DB.pin = id; msg("Staying on " .. ItemText(id) .. " until you uncheck Stay (or /snipe stay again).")
+    else
+      msg("Open an item first.")
+    end
   elseif cmd == "market" then
     wb_AHSnipe_MarketReport()
   elseif cmd == "status" then
@@ -1265,6 +1354,8 @@ local function Under(itemID, cap)
 end
 
 local function BackIn()
+  if DB.pin and DB.pin == OpenItemID() then return "  Staying here (pinned)." end
+  if DB.baitOn and DB.baitOn[OpenItemID() or 0] then return "  Staying here (bait on)." end
   if lastBrowse == "fav" and DB.roam ~= false then
     return "  Back to favorites in " .. math.max(1, BackLimit() - overCount) .. "."
   end
@@ -1304,6 +1395,10 @@ local function NextPress()
     cap, nextTier = GapCap(id, cap)
     local under, afford, cheapest, n = Under(id, cap)
     if n == 0 then return "Loading listings", "", "wait" end
+    local bait = wb_AHSnipe_BaitStatus(id, cap)
+    if bait and bait.state == "post" and afford < math.max(2, DB.minQty or MIN_QTY) and not pending then
+      return "Post bait: 1 at " .. Coins(cap), "Your own bait, so undercutters post under it.", "go"
+    end
     if under == 0 then
       if cap < fullCap and cheapest and cheapest <= fullCap then
         return "No resale gap: refresh", "Next tier " .. Coins(nextTier) .. ", so buys at " .. Coins(cap) .. " or less." .. BackIn(), "idle"
@@ -1417,7 +1512,7 @@ local function StatLine(label, r)
   return "|cffaaaaaa" .. label .. ":|r " .. color .. pct .. "%|r won |cff888888(" .. r.won .. " of " .. n .. ")|r" .. avg
 end
 
-local SNIPE_H, SETUP_H = 384, 384
+local SNIPE_H, SETUP_H = 410, 384
 
 -- Size the window for the tab that's showing.
 function wb_AHSnipe_Layout()
@@ -1442,8 +1537,28 @@ local function BuildSnipePage(p)
   -- The open item
   local card = CreateFrame("Frame", nil, p)
   card:SetPoint("TOPLEFT", p, "TOPLEFT", 0, -92)
-  card:SetSize(290, 254)
-  card.name = Text(card, "GameFontHighlightLarge", 14, -2, nil, 262)
+  card:SetSize(290, 280)
+  card.name = Text(card, "GameFontHighlightLarge", 14, -2, nil, 196)
+  -- Stay: Snipe never leaves this item for favorites until you uncheck it.
+  local stay = CreateFrame("CheckButton", "wb_AHSnipeStay", card, "UICheckButtonTemplate")
+  stay:SetSize(24, 24)
+  stay:SetPoint("TOPLEFT", card, "TOPLEFT", 214, 2)
+  local stayText = stay:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  stayText:SetPoint("LEFT", stay, "RIGHT", 2, 0)
+  stayText:SetText("Stay")
+  stay:SetScript("OnClick", function(self)
+    local id = OpenItemID()
+    DB.pin = self:GetChecked() and id or nil
+    L("pin", { item = id, on = DB.pin and 1 or 0 })
+  end)
+  stay:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("Stay on this item")
+    GameTooltip:AddLine("Snipe won't jump back to favorites from this item until you uncheck it. Jumping into it from favorites still works.", 1, 1, 1, true)
+    GameTooltip:Show()
+  end)
+  stay:SetScript("OnLeave", GameTooltip_Hide)
+  card.stay = stay
   local maxLabel = Text(card, "GameFontNormal", 14, -26, "Max price")
   card.maxTag = card:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
   card.maxTag:SetPoint("LEFT", maxLabel, "RIGHT", 8, 0)
@@ -1481,12 +1596,35 @@ local function BuildSnipePage(p)
   card.market2 = Text(card, "GameFontHighlightSmall", 14, -204, nil, 262)
   card.sold = Text(card, "GameFontHighlightSmall", 14, -220, nil, 262)
   card.profit = Text(card, "GameFontHighlightSmall", 14, -236, nil, 262)
+
+  local bait = CreateFrame("CheckButton", "wb_AHSnipeBait", card, "UICheckButtonTemplate")
+  bait:SetSize(24, 24)
+  bait:SetPoint("TOPLEFT", card, "TOPLEFT", 10, -252)
+  local baitText = bait:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  baitText:SetPoint("LEFT", bait, "RIGHT", 2, 0)
+  baitText:SetText("Bait")
+  bait:SetScript("OnClick", function(self)
+    local id = OpenItemID()
+    if not id then return end
+    DB.baitOn = DB.baitOn or {}
+    DB.baitOn[id] = self:GetChecked() and true or nil
+    L("bait_toggle", { item = id, on = DB.baitOn[id] and 1 or 0 })
+  end)
+  bait:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("Post your own bait")
+    GameTooltip:AddLine("Keeps 1 of this item listed at your max, so sellers who undercut the lowest price post their stacks just under it. Snipe posts it on a press that would otherwise just refresh (needs the item in your bags; at most once a minute and 10 times a session). You also stay on this item while it's on.", 1, 1, 1, true)
+    GameTooltip:Show()
+  end)
+  bait:SetScript("OnLeave", GameTooltip_Hide)
+  card.bait = bait
+  card.baitNote = Text(card, "GameFontDisableSmall", 70, -258, nil, 206)
   settings.card = card
 
   -- No item open: what's under max on your favorites
   local favs = CreateFrame("Frame", nil, p)
   favs:SetPoint("TOPLEFT", p, "TOPLEFT", 0, -92)
-  favs:SetSize(290, 254)
+  favs:SetSize(290, 280)
   favs.title = Text(favs, "GameFontNormal", 14, -2, "Favorites under your max")
   favs.lines = {}
   for i = 1, 11 do favs.lines[i] = Text(favs, "GameFontHighlightSmall", 14, -10 - i * 17, nil, 262) end
@@ -1494,7 +1632,7 @@ local function BuildSnipePage(p)
 
   local roam = CreateFrame("CheckButton", "wb_AHSnipeRoam", p, "UICheckButtonTemplate")
   roam:SetSize(28, 28)
-  roam:SetPoint("TOPLEFT", p, "TOPLEFT", 12, -348)
+  roam:SetPoint("TOPLEFT", p, "TOPLEFT", 12, -374)
   local roamText = roam:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   roamText:SetPoint("LEFT", roam, "RIGHT", 4, 0)
   roamText:SetText("Jump in and out of favorites")
@@ -1676,6 +1814,7 @@ local function UpdateSnipePage()
   favs:SetShown(not id)
   if id then
     card.name:SetText(ItemText(id))
+    card.stay:SetChecked(DB.pin == id)
     local own = DB.caps[id]
     local set = own or DB.default
     local eff = Cap(id)
@@ -1710,6 +1849,15 @@ local function UpdateSnipePage()
     card.market:SetText(m1)
     card.market2:SetText(m2)
     card.profit:SetText(wb_AHSnipe_ProfitLine(id))
+    local on = DB.baitOn and DB.baitOn[id]
+    card.bait:SetChecked(on and true or false)
+    local bs = on and wb_AHSnipe_BaitStatus(id, Cap(id))
+    local NOTES = {
+      listed = "|cff55ff55yours is listed|r", covered = "someone's listing is already that low",
+      limit = "|cffff555510 posts this session|r", nobags = "|cffff5555none in your bags|r", post = "posts on your next press",
+    }
+    card.baitNote:SetText(not on and "1 at your max, to lure undercutters"
+      or (bs and (bs.state == "wait" and ("next post in " .. bs.inSec .. "s") or NOTES[bs.state])) or "")
     local sold, min = SoldPerDay(id), DB.minSold or MIN_SOLD
     if not sold then
       card.sold:SetText("|cffaaaaaaSold/day:|r |cff888888no TSM data|r")
@@ -2036,8 +2184,15 @@ lg:SetScript("OnEvent", function(_, e, a1, a2)
       end
     end
     if under > 0 and a1 == OpenItemID() then sawUnder = true end
+    local ownBait = 0
+    for i = 1, n do
+      local r = C_AuctionHouse.GetCommoditySearchResultInfo(a1, i)
+      if not r or (cap and r.unitPrice > cap) then break end
+      if (r.numOwnerItems or 0) > 0 then ownBait = 1 break end
+    end
     L(short, { item = a1, latency = ms(now - sentAt), top = table.concat(top, " "), cap = cap,
-      listings = n, underQty = under, underListings = underListings, jumped = jumped })
+      listings = n, underQty = under, underListings = underListings, jumped = jumped,
+      baitOn = DB.baitOn and DB.baitOn[a1] and 1 or nil, ownBait = ownBait })
   elseif e == "ITEM_SEARCH_RESULTS_UPDATED" then
     local key = a1
     local id = key and key.itemID
