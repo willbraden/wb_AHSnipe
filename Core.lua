@@ -33,6 +33,8 @@ local OVER_MAX_BACK = 10 -- presses in a row with nothing under max before going
 local EMPTY_JUMP_BACK = 3 -- ...or this many after a jump that found nothing under max, not even bait
 local overCount = 0
 local sawUnder = false   -- this item page has shown units under max (a deal or bait) since you landed
+local BAIT_GIVEUP = 400  -- presses parked on bait with no real deal before buying the bait to move on
+local baitPresses = 0
 local lastBrowse = "text" -- "fav" when the browse list is showing your favorites
 local FAV_ALERT = 0.25 -- favorites: flag price moves of at least 25% between refreshes
 local favChanges = {}  -- itemID -> fraction change at the last price move
@@ -471,15 +473,25 @@ end
 -- Resale gap: only buy units at least Gap % (Setup; default 20, 0 = off)
 -- under the next price tier above your max, which is about where you'd
 -- relist them. Returns the max to use for this list and that next tier.
+-- The max the resale gap allowed on each item's last loaded list. Favorites
+-- only show a lowest price, not the tiers, so jumping uses this to skip an
+-- item the gap just ruled out (instead of jumping in and out on a loop).
+local gapSeen = {}
+local GAP_MEMORY = 300 -- seconds
+
 local function GapCap(itemID, cap)
   local gap = DB.gapPct or GAP_PCT
   if not cap or gap <= 0 then return cap end
-  for i = 1, C_AuctionHouse.GetNumCommoditySearchResults(itemID) or 0 do
+  local n = C_AuctionHouse.GetNumCommoditySearchResults(itemID) or 0
+  for i = 1, n do
     local r = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, i)
     if r and r.unitPrice > cap and r.quantity - (r.numOwnerItems or 0) > 0 then
-      return math.min(cap, math.floor(r.unitPrice * (100 - gap) / 100)), r.unitPrice
+      local g = math.min(cap, math.floor(r.unitPrice * (100 - gap) / 100))
+      if g < cap then gapSeen[itemID] = { cap = g, at = GetTime() } else gapSeen[itemID] = nil end
+      return g, r.unitPrice
     end
   end
+  if n > 0 then gapSeen[itemID] = nil end
   return cap
 end
 wb_AHSnipe_CapOf = Cap
@@ -555,6 +567,9 @@ local function Deals()
   for _, r in ipairs(res or {}) do
     local id = r.itemKey and r.itemKey.itemID
     local cap = id and IsFav(r.itemKey) and not SlowSeller(id) and Cap(id)
+    -- The resale gap ruled this price out on the item's last list (5 min).
+    local g = id and gapSeen[id]
+    if cap and g and GetTime() - g.at < GAP_MEMORY then cap = math.min(cap, g.cap) end
     if cap and r.minPrice and r.minPrice > 0 and r.minPrice <= cap then
       out[#out + 1] = { r = r, id = id, price = r.minPrice, cap = cap, score = (cap - r.minPrice) / cap }
     end
@@ -726,11 +741,18 @@ local function BuyCommodity()
   end
 
   local minQty = math.max(2, DB.minQty or MIN_QTY) -- 1 cheap unit is always bait
+  local baitBuy = false
   if qty < minQty then
     overCount = 0 -- bait under max: stay parked
-    local sent = wb_AHSnipe_Refresh(true)
-    L("press", { step = "under_min", item = itemID, qty = qty, min = minQty, listAge = listAge, sent = sent and 1 or 0 })
-    return
+    baitPresses = baitPresses + 1
+    if baitPresses < BAIT_GIVEUP then
+      local sent = wb_AHSnipe_Refresh(true)
+      L("press", { step = "under_min", item = itemID, qty = qty, min = minQty, listAge = listAge, sent = sent and 1 or 0 })
+      return
+    end
+    -- No real deal after BAIT_GIVEUP presses: buy the bait so you can move on.
+    baitBuy = true
+    L("press", { step = "bait_buy", item = itemID, qty = qty, presses = baitPresses })
   end
 
   -- Ask for only part of the cheap units. If another buyer takes a few
@@ -740,6 +762,7 @@ local function BuyCommodity()
   attemptPct[itemID] = pct
   local want = math.max(1, math.ceil(avail * pct / 100))
   want = math.min(want, avail - 1) -- always leave at least one unit
+  if baitBuy then want = avail end  -- ...except when giving up on bait: take it
   if want < avail then
     qty, total = 0, 0
     for i = 1, n do
@@ -751,7 +774,7 @@ local function BuyCommodity()
     end
   end
 
-  overCount = 0
+  overCount, baitPresses = 0, 0
   quote = { itemID = itemID, qty = qty, maxTotal = qty * cap, at = now, est = total }
   L("quote_start", { item = itemID, qty = qty, avail = avail, pct = pct, est = total, cap = cap, listings = n, listAge = listAge })
   C_AuctionHouse.StartCommoditiesPurchase(itemID, qty)
@@ -774,6 +797,11 @@ function wb_AHSnipe_Buy()
   elseif ah.CommoditiesBuyFrame and ah.CommoditiesBuyFrame:IsShown() then
     BuyCommodity()
   else
+    -- Jump is off: ask once per AH visit whether to turn it on.
+    if lastBrowse == "fav" and DB.roam == false and not wb_AHSnipe_RoamAsked then
+      wb_AHSnipe_RoamAsked = true
+      StaticPopup_Show("WBAHSNIPE_ROAM")
+    end
     if lastBrowse == "fav" and DB.roam ~= false then
       local deals = Deals()
       if #deals > 0 then
@@ -808,6 +836,7 @@ for _, e in ipairs({
   "AUCTION_HOUSE_BROWSE_RESULTS_UPDATED",
   "ITEM_SEARCH_RESULTS_UPDATED",
   "COMMODITY_SEARCH_RESULTS_UPDATED",
+  "AUCTION_HOUSE_SHOW",
   "AUCTION_HOUSE_CLOSED",
   "COMMODITY_PRICE_UPDATED",
   "COMMODITY_PRICE_UNAVAILABLE",
@@ -817,7 +846,46 @@ for _, e in ipairs({
   "UI_ERROR_MESSAGE",
 }) do pcall(f.RegisterEvent, f, e) end
 
+-- Expected profit per buy and per hour ------------------------------------
+-- A buy's expected profit: what it should resell for (TSM's sale average,
+-- else the market Snipe last saw) after the AH cut, minus what you paid.
+-- The hourly rate counts only time the AH is open this session.
+local sess = { profit = 0, ahTime = 0 }
+local function AHTime()
+  return sess.ahTime + (sess.openAt and (GetTime() - sess.openAt) or 0)
+end
+local function GoldText(c)
+  c = math.floor(c + 0.5)
+  return (c < 0 and "|cffff5555-|r" or "|cff55ff55+|r") .. Coins(math.abs(c))
+end
+-- "+8250/h  +41204": the session's rate per hour, then its total so far.
+-- At least 5 minutes in the rate, so the first buy doesn't show a wild number.
+local function SessionCell()
+  if sess.profit == 0 then return "" end
+  local rate = sess.profit / math.max(AHTime() / 3600, 1 / 12)
+  return GoldText(rate) .. "|cffaaaaaa/h|r  " .. GoldText(sess.profit)
+end
+
+-- Returns the profit cell and the session cell for a Bought row.
+local function BuyProfit(id, qty, total)
+  local each = SoldValue(id) or (DB.mkt and DB.mkt[id] and DB.mkt[id].now)
+  if not each or not total then return "|cff888888?|r", SessionCell() end
+  local p = qty * each * (1 - AH_CUT_PCT / 100) - total
+  sess.profit = sess.profit + p
+  return GoldText(p), SessionCell()
+end
+function wb_AHSnipe_SessionRate()
+  local h = AHTime() / 3600
+  return sess.profit, h, sess.profit / math.max(h, 1 / 12)
+end
+
 f:SetScript("OnEvent", function(_, e, arg1, arg2)
+  if e == "AUCTION_HOUSE_SHOW" then sess.openAt = sess.openAt or GetTime() end
+  if e == "AUCTION_HOUSE_CLOSED" then wb_AHSnipe_RoamAsked = nil end
+  if e == "AUCTION_HOUSE_CLOSED" and sess.openAt then
+    sess.ahTime = sess.ahTime + (GetTime() - sess.openAt)
+    sess.openAt = nil
+  end
   if e == "ADDON_LOADED" then
     if arg1 == "wb_AHSnipe" then
       wb_AHSnipeDB = wb_AHSnipeDB or {}
@@ -838,10 +906,10 @@ f:SetScript("OnEvent", function(_, e, arg1, arg2)
     local b = buying
     buying = nil
     if b then
-      local each = b.total and b.qty > 0 and math.floor(b.total / b.qty + 0.5)
       Tally(b.item, true, b.qty, b.total)
-      Row({ "|cffffd100Bought|r", "|cffffd100" .. b.qty .. "|r", ItemText(b.item), Coins(b.total or 0),
-        each and ("|cffaaaaaa(|r" .. Coins(each) .. " |cffaaaaaaeach)|r") or "", MaxCell(b.item), WinCell(b.item) .. PctNote(b.item) })
+      local profit, hourly = BuyProfit(b.item, b.qty, b.total)
+      Row({ "|cffffd100Bought|r", "|cffffd100" .. b.qty .. "|r", ItemText(b.item), profit, hourly,
+        MaxCell(b.item), WinCell(b.item) .. PctNote(b.item) })
     else
       msg("|cffffd100Bought.|r")
     end
@@ -858,7 +926,8 @@ f:SetScript("OnEvent", function(_, e, arg1, arg2)
   if e == "AUCTION_HOUSE_PURCHASE_COMPLETED" then
     if bidding then
       Tally(bidding.item, true, 1, bidding.price)
-      Row({ "|cffffd100Bought|r", "|cffffd1001|r", ItemText(bidding.item), Coins(bidding.price), "", MaxCell(bidding.item), WinCell(bidding.item) })
+      local profit, hourly = BuyProfit(bidding.item, 1, bidding.price)
+      Row({ "|cffffd100Bought|r", "|cffffd1001|r", ItemText(bidding.item), profit, hourly, MaxCell(bidding.item), WinCell(bidding.item) })
       bidding = nil
     end
     return
@@ -976,6 +1045,18 @@ local function ShowMax(b, v)
   end
 end
 
+StaticPopupDialogs["WBAHSNIPE_ROAM"] = {
+  text = "Jumping into favorites is off, so Snipe will only refresh your favorites list.\n\nTurn jumping on?",
+  button1 = "Turn on",
+  button2 = "Keep off",
+  OnAccept = function()
+    DB.roam = true
+    if settings and settings.roam then settings.roam:SetChecked(true) end
+    L("roam", { on = 1, via = "popup" })
+  end,
+  timeout = 0, whileDead = true, hideOnEscape = true, preferredIndex = 3,
+}
+
 function wb_AHSnipe_ToggleRoam()
   DB.roam = not (DB.roam ~= false)
   if settings and settings.roam then settings.roam:SetChecked(DB.roam) end
@@ -1026,6 +1107,7 @@ local function HookSearchButtons()
       fr:HookScript("OnShow", function()
         overCount = 0
         sawUnder = false
+        baitPresses = 0
         L("view", { show = name, item = OpenItemID(), via = (jumped and GetTime() - (jumpAt or 0) < 1) and "jump" or "you", list = lastBrowse })
         if name == "BrowseResultsFrame" then jumped = nil end
       end)
@@ -1233,7 +1315,10 @@ local function NextPress()
     end
     local minQty = math.max(2, DB.minQty or MIN_QTY)
     if afford < minQty then
-      return "Bait: " .. afford .. " under max, refresh", "Buys at " .. minQty .. "+ (Min qty).", "idle"
+      if baitPresses >= BAIT_GIVEUP - 1 then
+        return "Buy the bait: " .. afford .. " from " .. Coins(cheapest), "No real deal in " .. BAIT_GIVEUP .. " presses, so it takes the bait to move on.", "go"
+      end
+      return "Bait: " .. afford .. " under max, refresh", "Buys at " .. minQty .. "+ (Min qty). Takes the bait in " .. (BAIT_GIVEUP - baitPresses) .. " presses.", "idle"
     end
     local pct = PickPct(id)
     local want = math.min(math.max(1, math.ceil(afford * pct / 100)), afford - 1)
@@ -2135,6 +2220,9 @@ local function FloorFromItem(key)
   return prices[math.max(1, math.ceil(#prices * 0.25))], prices[1], #prices
 end
 
+-- (Profit and market live in one do-block so their locals don't count
+-- toward Lua's 200-locals limit for this file.)
+do
 -- Realized profit ------------------------------------------------------------
 -- Snipe keeps its own live ledger, so profit updates the moment it happens:
 --   buys:  every snipe you win (exact qty and price)
@@ -2461,6 +2549,7 @@ mf:SetScript("OnEvent", function(_, e, a1)
     RecordMarket(a1.itemID, FloorFromItem(a1))
   end
 end)
+end
 
 local function ShowCheckPanel()
   if not lastCheck or not settings then return end

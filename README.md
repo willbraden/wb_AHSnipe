@@ -6,11 +6,12 @@ A World of Warcraft: Forever addon for fast auction house sniping with the stock
 
 - **One-button snipe.** Each press does the next step: refresh, quote, confirm, then refresh again after a buy.
 - **Jump sound.** Plays when Snipe jumps from your favorites into an item that's under your max. Pick the sound (Ping, Coins, Whisper, Raid warning, Soft click, or Say item, which speaks the item name with the game's text to speech) or turn it off on the Setup tab.
+- **Profit on every buy.** Each Bought line shows what that buy should make when you resell it (at TSM's sale average, after the AH cut) and your expected gold per hour and total so far this session, counting only time the AH is open.
 - **Next press line.** The AH Snipe window says what your next press will do and why: buy, quote, jump to a deal, bait, nothing under max, can't afford, waiting for the server. Green means it will buy or jump, gray means it will refresh, red means something is blocking it.
 - **One window, four tabs.** **Snipe** shows the next press and the open item (its max, Buy %, win rate and average paid), or your favorites under max when no item is open. **Sell** shows Bought vs selling. **Setup** holds your defaults, Explore and Check prices. **Buy %** shows win rates. The window follows the AH's own Buy and Sell tabs.
 - **Never jams the AH.** It won't send a new request while one is still waiting, so a confirmed purchase can't be knocked out by your next press.
 - **Max price per item**, set in AH-style gold, silver and copper boxes (click to select, type, Enter). Items without their own max use your default.
-- **Min qty** for commodities. Skips bait listings smaller than this (never less than 2).
+- **Min qty** for commodities. Skips bait listings smaller than this (never less than 2). If you stay parked on bait for 400 presses with no real deal, Snipe buys the bait so you can move on.
 - **Buy %.** Each commodity buy asks for this share of the cheap units, so another buyer taking a few doesn't sink your whole purchase. It tops out at 95% and always leaves at least 1 cheap unit on the list.
 - **Favorites mode.** On your favorites list, Snipe opens the best deal (furthest under its max). After 10 presses with nothing under max, it goes back to favorites, or after 3 if the cheap units were already gone when it landed (no deal and no bait). A checkbox (or keybind) turns this off so you can camp one item.
 - **Check prices.** One click checks every favorite automatically and suggests a max at your **Check %** of market (default 70%). If it's been an hour since your last check, opening the AH asks you to check first, and Snipe won't buy until you answer.

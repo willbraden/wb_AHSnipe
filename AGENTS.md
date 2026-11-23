@@ -40,7 +40,7 @@ It reads **Max price**, **Min qty** and **Buy %** from the window, feeds **Win t
 ### Refresh and favorites
 - `wb_AHSnipe_Refresh` reruns the current search (item page, favorites or text search). It is gated by rule 1 and by a 0.6s gap for manual presses.
 - `wb_AHSnipe_Favorites` runs the favorites search and sets `lastBrowse = "fav"`. Hooks on the native star and Search buttons keep `lastBrowse` correct.
-- **Jump in and out of favorites** (`DB.roam`): with it on, Snipe opens green favorites, and after 10 presses in a row with nothing under max (`OverMax`) you go back to favorites. If the page has shown nothing under max at all since the jump (not even bait, tracked by `sawUnder`), it goes back after 3 presses instead (`EMPTY_JUMP_BACK`, via `BackLimit()`). Bait (cheap units below Min qty) resets that count, because the user likes staying parked on bait.
+- **Jump in and out of favorites** (`DB.roam`): with it on, Snipe opens green favorites, and after 10 presses in a row with nothing under max (`OverMax`) you go back to favorites. If the page has shown nothing under max at all since the jump (not even bait, tracked by `sawUnder`), it goes back after 3 presses instead (`EMPTY_JUMP_BACK`, via `BackLimit()`). Bait (cheap units below Min qty) resets that count, because the user likes staying parked on bait. After 400 presses parked on bait with no real deal (`BAIT_GIVEUP`, `baitPresses`, reset on each landing and each quote), the next press buys the bait units so the user can move on; this is the one exception to the leave-one rule, and the Next press line counts down to it. With Jump off, the first Snipe press on favorites in each AH visit shows the `WBAHSNIPE_ROAM` popup offering to turn it on (`wb_AHSnipe_RoamAsked`, reset when the AH closes).
 
 ### The AH Snipe window
 One window to the right of the AH, with four tabs. It follows the AH: the AH's Sell tab switches it to **Sell**, going back switches it to **Snipe**. Setup and Buy % are only opened by a click. `wb_AHSnipe_SelectTab(i)` switches tabs and `wb_AHSnipe_Layout()` sizes the window for the tab.
@@ -57,9 +57,9 @@ One window to the right of the AH, with four tabs. It follows the AH: the AH's S
 ### Settings
 - **Max price** (gold/silver/copper): saved per item in `DB.caps[itemID]` from the Snipe tab's card, or as `DB.default` from Setup. Everything that asks "is this a deal?" calls `Cap(itemID)`, which is the item's own max (or the default) **lowered to the TSM ceiling** when that's cheaper, or the TSM ceiling alone when neither is set.
 - **Max % TSM** (`DB.tsmPct`, default 90, 0 = off): the TSM ceiling is this % of TSM's region sale average (`DBRegionSaleAvg`, what buyers actually paid). `Ceiling()` computes it.
-- **Resale gap %** (`DB.gapPct`, default 20, 0 = off): `GapCap()` finds the first listing priced above the max (the next tier, about where you'd relist) and lowers the max for this list to that price minus the gap. The buy and `NextPress()` both apply it ("No resale gap: refresh").
+- **Resale gap %** (`DB.gapPct`, default 20, 0 = off): `GapCap()` finds the first listing priced above the max (the next tier, about where you'd relist) and lowers the max for this list to that price minus the gap. The buy and `NextPress()` both apply it ("No resale gap: refresh"). `GapCap()` also remembers the gap-limited max per item for 5 minutes (`gapSeen`), and `Deals()` uses it, so Snipe doesn't keep jumping into a favorite the gap just ruled out (favorites only show a lowest price, not the tiers).
 - **Min qty** (`DB.minQty`): commodity buys skip unless at least this many units are under max. This is the bait filter.
-- **Buy %**: the share of cheap units each commodity quote asks for, so another buyer taking a few doesn't sink the whole purchase. `DB.itemPct[itemID]` (Snipe tab card) if set, else `DB.buyPct` (Setup). `PickPct()` decides which applies. It tops out at 95% (`MAX_PCT`), and a buy always leaves at least 1 cheap unit, so bait is never bought.
+- **Buy %**: the share of cheap units each commodity quote asks for, so another buyer taking a few doesn't sink the whole purchase. `DB.itemPct[itemID]` (Snipe tab card) if set, else `DB.buyPct` (Setup). `PickPct()` decides which applies. It tops out at 95% (`MAX_PCT`), and a buy always leaves at least 1 cheap unit, so bait isn't bought (except the 400-press give-up above).
 - **Explore** (`DB.explore`, Setup): sits in a box with the general Buy % because it takes it over. While on, both Buy % inputs are locked and `PickPct()` rotates 35/50/66/85%, least-tested first. It keeps its pick for an item until that attempt finishes, so the % the window shows is the % the key uses.
 - **Check %** (`DB.checkPct`, default 70): what Price check multiplies market by.
 
@@ -89,7 +89,7 @@ Every time the AH opens, if `DB.lastCheckAt` is 1+ hour old (or missing), a popu
 
 ### Chat output
 - Messages go to a dedicated **AH Snipe** chat tab (`/snipe tab` switches back to main chat).
-- `Row()` prints aligned columns: what happened, quantity, item, price, details, your max, win rate. `Fail()` and the Bought lines in the event handler are the main callers. Failed rows and price rises are grayed with `Dim()`.
+- `Row()` prints aligned columns: what happened, quantity, item, price, details, your max, win rate. On **Bought** rows, the price column is the buy's **expected profit** (resale at TSM's sale average, or the market Snipe last saw, after the 5% cut, minus what you paid) and the details column is the session's **expected profit per hour, then its total so far**, counting only time the AH is open (`BuyProfit()`, `wb_AHSnipe_SessionRate()`; at least 5 minutes in the denominator). `Fail()` and the Bought lines in the event handler are the main callers. Failed rows and price rises are grayed with `Dim()`.
 - The mono font (`/snipe mono`) applies to every chat window; `Row()` relies on it for exact alignment.
 
 ### Native AH highlights
@@ -128,5 +128,5 @@ Everything ──▶ L() log ──▶ export.py CSVs ──▶ analysis skill
 - **You add a chat line:** you print it with `Row()` so it stays aligned, and you pass a `MaxCell()` and `WinCell()` if it is about an item.
 - **You add a window or panel:** you don't. You add it to one of the window's tabs (or a new tab in `BuildBox()`), and size it in `wb_AHSnipe_Layout()`.
 - **You add a log event:** you document it in the analysis skill's event table, and in `export.py` if a CSV should use it.
-- **You add a top-level `local`:** you remember WoW's Lua allows 200 per file. `Core.lua` is close; split into files (and list them in the `.toc`) before adding many more.
+- **You add a top-level `local`:** you remember Lua allows 200 active locals in the file's main chunk. `Core.lua` hit it once; the profit and market sections now sit in a `do ... end` block so their locals don't count. Put new self-contained sections in their own `do` block (expose what others need as `wb_AHSnipe_*` globals), or split into files listed in the `.toc`.
 - **You ship it:** you copy the files to the user's `AddOns/wb_AHSnipe` folder and stamp `Build.lua` with the time and commit (or push to GitHub when they ask, after regenerating `Snapshot.lua`), and you tell them whether `/reload` is enough or a full restart is needed (new files such as fonts or textures need a restart).
