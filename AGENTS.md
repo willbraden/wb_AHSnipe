@@ -31,7 +31,7 @@ In a game install, the addon lives in `<WoW folder>/_forever_/Interface/AddOns/w
 
 ### The Snipe key (`wb_AHSnipe_Buy`)
 The one button the user spams. It only ever buys the user's **current favorites** (`IsFav()`, via `C_AuctionHouse.IsFavoriteItem`): a max stays saved after an item is unstarred but does nothing until it's starred again, and `Deals()` skips unstarred items still sitting on a stale favorites list. Each press does the next useful step for the screen they are on:
-- **Favorites list:** if Jump is on and a favorite is at or under its max, you open the best one (furthest under max). Otherwise you refresh favorites.
+- **Favorites list:** if a favorite is at or under its max, you open the best one (furthest under max). Otherwise you refresh favorites.
 - **Commodity page:** refresh if the list is stale; quote if enough cheap units are listed; confirm once the quote is back; wait while a buy is in flight.
 - **Single-item page:** bid on the cheapest listing under max, or refresh.
 
@@ -40,30 +40,27 @@ It reads **Max price**, **Min qty** and **Buy %** from the window, feeds **Win t
 ### Refresh and favorites
 - `wb_AHSnipe_Refresh` reruns the current search (item page, favorites or text search). It is gated by rule 1 and by a 0.6s gap for manual presses.
 - `wb_AHSnipe_Favorites` runs the favorites search and sets `lastBrowse = "fav"`. Hooks on the native star and Search buttons keep `lastBrowse` correct.
-- **Jump in and out of favorites** (`DB.roam`): with it on, Snipe opens green favorites, and after 10 presses in a row with nothing under max (`OverMax`) you go back to favorites. If the page has shown nothing under max at all since the jump (not even bait, tracked by `sawUnder`), it goes back after 3 presses instead (`EMPTY_JUMP_BACK`, via `BackLimit()`). Bait (cheap units below Min qty) resets that count, because the user likes staying parked on bait. After 400 presses parked on bait with no real deal (`BAIT_GIVEUP`, `baitPresses`, reset on each landing and each quote), the next press buys the bait units so the user can move on; this is the one exception to the leave-one rule, and the Next press line counts down to it. **Stay** (`DB.pin`, the checkbox at the top right of the Snipe tab's item card, or `/snipe stay`) pins one item: `OverMax()` never sends you back to favorites from it, and the Next press line says "Staying here (pinned)". With Jump off, the first Snipe press on favorites in each AH visit shows the `WBAHSNIPE_ROAM` popup offering to turn it on (`wb_AHSnipe_RoamAsked`, reset when the AH closes).
+- **Jumping in and out** is always on (there's no setting; old saved `DB.roam` is cleared at load): Snipe opens green favorites, and after 10 presses in a row with nothing under max (`OverMax`) you go back to favorites. If the page has shown nothing under max at all since the jump (not even bait, tracked by `sawUnder`), it goes back after 3 presses instead (`EMPTY_JUMP_BACK`, via `BackLimit()`). Bait (cheap units below Min qty) resets that count, because the user likes staying parked on bait. After 400 presses parked on bait with no real deal (`BAIT_GIVEUP`, `baitPresses`, reset on each landing and each quote), the next press buys the bait units so the user can move on; this is the one exception to the leave-one rule, and the Next press line counts down to it. **Stay** (`DB.pin`, the checkbox at the top right of the Snipe tab's item card, `/snipe stay`, or the old "jump" keybind `wb_AHSnipe_ToggleRoam`) is the only way to stop the leaving: `OverMax()` never sends you back from a pinned item, and the Next press line says "Staying here (pinned)".
 
 ### The AH Snipe window
 One window to the right of the AH, with four tabs. It follows the AH: the AH's Sell tab switches it to **Sell**, going back switches it to **Snipe**. Setup and Buy % are only opened by a click. `wb_AHSnipe_SelectTab(i)` switches tabs and `wb_AHSnipe_Layout()` sizes the window for the tab.
 
-- **Snipe:** the **Next press** line, then the open item's card (max, Buy %, win rate and average paid this session and all-time). With no item open, the card is replaced by your favorites under max. The Jump checkbox sits at the bottom.
+- **Snipe:** the **Next press** line, then the open item's card, kept short on purpose: name, Stay, max, and one line with this session's win rate and expected profit for the item (`SessionSummary()`). Everything else (Buy % in use and why, all-time win rate, market, sold/day, realized profit) is in the tooltip on the item name (`wb_AHSnipe_ItemDetails()`). The Next press detail line only shows for gray (refresh) and red (blocked) states. The window's height follows what's showing (`settings.snipeH`). With no item open, the card is replaced by your favorites under max. **Keep this tab sparse:** new per-item info goes in the name tooltip, not on the card.
 - **Sell:** Bought vs selling.
 - **Setup:** default max, Min qty, Check %, general Buy % with Explore, Check prices, and the price check results.
-- **Buy %:** win rates per Buy %.
+- **Buy %:** win rates per Buy %, the best per item, and the % each item uses now.
 
 **Next press** (`NextPress()`, also `wb_AHSnipe_NextPress`) mirrors the Snipe key's decisions without sending anything: buy, quote, jump, bait, nothing under max, can't afford, no max, waiting for the server, price check running, or the price reminder. Its border is green (will buy or jump), yellow (waiting), gray (will refresh) or red (blocked). **When you change what the Snipe key decides, you change `NextPress()` the same way**, or the window will say one thing and the key will do another.
 
 **Jump sound:** when the Snipe key jumps from favorites into a deal, `wb_AHSnipe_PlayTick(itemID)` plays the chosen sound (`DB.tickSound`, Ping by default) or speaks the item name with `C_VoiceChat.SpeakText` (falls back to Ping). Setup has the on/off checkbox (`DB.tick`) and a button that cycles and previews the sounds.
-
-### Your own bait (experiment)
-Per item, the **Bait** checkbox on the Snipe tab's card (`DB.baitOn[id]`) keeps 1 unit listed at your max (`Cap()`), so sellers who undercut the lowest listing post just under it. `wb_AHSnipe_TryBait()` posts with `C_AuctionHouse.PostCommodity` (12h, 1 unit) only on a Snipe press that would otherwise refresh (nothing under max, or only bait), with nothing queued or pending, when no listing (yours or anyone's) is already at or under that price, and the item is in your bags. It posts at most once a minute and 10 times per item per session. While bait is on for an item you stay parked on it. `wb_AHSnipe_BaitStatus()` drives the card note and the Next press line ("Post bait: 1 at …"). Logged as `bait_post`, `bait_error`, `bait_toggle`, and every commodity list row carries `baitOn` and `ownBait` so you can compare cheap-stack arrivals with and without bait.
 
 ### Settings
 - **Max price** (gold/silver/copper): saved per item in `DB.caps[itemID]` from the Snipe tab's card, or as `DB.default` from Setup. Everything that asks "is this a deal?" calls `Cap(itemID)`, which is the item's own max (or the default) **lowered to the TSM ceiling** when that's cheaper, or the TSM ceiling alone when neither is set.
 - **Max % TSM** (`DB.tsmPct`, default 90, 0 = off): the TSM ceiling is this % of TSM's region sale average (`DBRegionSaleAvg`, what buyers actually paid). `Ceiling()` computes it.
 - **Resale gap %** (`DB.gapPct`, default 20, 0 = off): `GapCap()` finds the first listing priced above the max (the next tier, about where you'd relist) and lowers the max for this list to that price minus the gap. The buy and `NextPress()` both apply it ("No resale gap: refresh"). `GapCap()` also remembers the gap-limited max per item for 5 minutes (`gapSeen`), and `Deals()` uses it, so Snipe doesn't keep jumping into a favorite the gap just ruled out (favorites only show a lowest price, not the tiers).
 - **Min qty** (`DB.minQty`): commodity buys skip unless at least this many units are under max. This is the bait filter.
-- **Buy %**: the share of cheap units each commodity quote asks for, so another buyer taking a few doesn't sink the whole purchase. `DB.itemPct[itemID]` (Snipe tab card) if set, else `DB.buyPct` (Setup). `PickPct()` decides which applies. It tops out at 95% (`MAX_PCT`), and a buy always leaves at least 1 cheap unit, so bait isn't bought (except the 400-press give-up above).
-- **Explore** (`DB.explore`, Setup): sits in a box with the general Buy % because it takes it over. While on, both Buy % inputs are locked and `PickPct()` rotates 35/50/66/85%, least-tested first. It keeps its pick for an item until that attempt finishes, so the % the window shows is the % the key uses.
+- **Buy %**: the share of cheap units each commodity quote asks for, so another buyer taking a few doesn't sink the whole purchase. With Explore off, `PickPct()` uses `SavedPct()`: the item's proven best (`BestPct()`: most units won per try among Buy % values with `MIN_TRIES` (4)+ tries), else `DB.itemPct[itemID]` if one was saved, else `DB.buyPct` (Setup). It tops out at 95% (`MAX_PCT`), and a buy always leaves at least 1 cheap unit, so bait isn't bought (except the 400-press give-up above).
+- **Explore** (`DB.explore`, Setup): sits in a box with the general Buy % because it takes it over. While on, the general Buy % input is locked and `PickPct()` first gives each of 35/50/66/85% `MIN_TRIES` tries (least-tested first), then uses the best and tests another % only one try in `EXPLORE_EVERY` (5), so it settles instead of rotating forever. It keeps its pick for an item until that attempt finishes, so the % the window shows is the % the key uses.
 - **Check %** (`DB.checkPct`, default 70): what Price check multiplies market by.
 
 ### Price check (`wb_AHSnipe_Check`)
@@ -86,13 +83,13 @@ Every time the AH opens, if `DB.lastCheckAt` is 1+ hour old (or missing), a popu
 
 ### Win tracking and Buy % learning
 - `Tally()` runs on every buy result: wins and losses per item, for this session (`session`) and all-time (`DB.stats`), plus per Buy % (`DB.tune[id][pct]`) and per hour (`DB.hourly`).
-- The **Buy %** tab shows each item's win rate and tries at each Buy %, marks the best by units won per try (4+ tries), and saves it per item with **Use N%** or **Use best for all items**. `/snipe tune` opens it.
+- The **Buy %** tab shows each item's win rate and tries at each Buy %, marks the best by units won per try (4+ tries), and shows the % each item uses now (its best, or "(all)" for the general Buy %). Bests apply automatically, so there are no save buttons. `/snipe tune` opens it.
 - `/snipe stats` prints the per-item win table to chat.
 - **Bought vs selling** (on the AH Sell tab) reads `session` and `DB.stats` to show average cost against the posting price after the 5% AH cut.
 
 ### Chat output
 - Messages go to a dedicated **AH Snipe** chat tab (`/snipe tab` switches back to main chat).
-- `Row()` prints aligned columns: what happened, quantity, item, price, details, your max, win rate. On **Bought** rows, the price column is the buy's **expected profit** (resale at TSM's sale average, or the market Snipe last saw, after the 5% cut, minus what you paid) and the details column is the session's **expected profit per hour, then its total so far**, counting only time the AH is open (`BuyProfit()`, `wb_AHSnipe_SessionRate()`; at least 5 minutes in the denominator). `Fail()` and the Bought lines in the event handler are the main callers. Failed rows and price rises are grayed with `Dim()`.
+- `Row()` prints aligned columns: what happened, quantity, item, price, details, then your max on price drops. Bought rows stop after the session cell, Failed rows show only the item and the reason, and a favorite's price change only gets a line when it drops to or under your max (rises are logged as `fav_move` but not shown). On **Bought** rows, the price column is the buy's **expected profit** (resale at TSM's sale average, or the market Snipe last saw, after the 5% cut, minus what you paid) and the details column is the session's **expected profit per hour, then its total so far**, counting only time the AH is open (`BuyProfit()`, `wb_AHSnipe_SessionRate()`; at least 5 minutes in the denominator). `Fail()` and the Bought lines in the event handler are the main callers. Failed rows are grayed with `Dim()`.
 - The mono font (`/snipe mono`) applies to every chat window; `Row()` relies on it for exact alignment.
 
 ### Native AH highlights
@@ -120,7 +117,7 @@ Buy % tab ◀── tune ◀─────────────────�
 Price check ──(Check %)──▶ suggested maxes ──▶ Max (Setup results)
      ▲
 Stale reminder (lastCheckAt) ──blocks──▶ Snipe key
-Favorites refresh ──▶ Jump ──▶ item page ──(10 empty presses)──▶ back to favorites
+Favorites refresh ──▶ Jump ──▶ item page ──(10 empty presses, unless Stay)──▶ back to favorites
 Everything ──▶ L() log ──▶ export.py CSVs ──▶ analysis skill
 ```
 

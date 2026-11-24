@@ -6,7 +6,7 @@ BINDING_HEADER_WBAHSNIPE = "wb_AH Snipe"
 BINDING_NAME_WBAHSNIPE_REFRESH = "Refresh AH"
 BINDING_NAME_WBAHSNIPE_FAVS = "Refresh favorites"
 BINDING_NAME_WBAHSNIPE_CHECK = "Check prices (one favorite per press)"
-BINDING_NAME_WBAHSNIPE_ROAM = "Toggle jumping in and out of favorites"
+BINDING_NAME_WBAHSNIPE_ROAM = "Toggle Stay on the open item"
 BINDING_NAME_WBAHSNIPE_BUY = "Snipe (one button: refresh, quote, buy)"
 
 local MIN_GAP = 0.6      -- seconds between searches
@@ -203,20 +203,56 @@ local function Tries(id, p)
   return r and (r.won + r.lost) or 0
 end
 
-local function PickPct(id)
-  if DB.explore then
-    if id and nextPct[id] then return nextPct[id] end
-    local t = DB.tune and DB.tune[id] or {}
-    local best, bestN
-    for _, p in ipairs(PCTS) do
-      local r = t[p]
-      local n = r and (r.won + r.lost) or 0
-      if not best or n < bestN or (n == bestN and math.random() < 0.5) then best, bestN = p, n end
-    end
-    if id then nextPct[id] = best end
-    return best
+-- An item's proven Buy %: the most units won per try, among the ones with
+-- at least MIN_TRIES tries. nil until one has enough.
+local MIN_TRIES = 4
+local function BestPct(id)
+  local t = id and DB.tune and DB.tune[id]
+  if not t then return end
+  local best, bestEV
+  for _, p in ipairs(PCTS) do
+    local r = t[p]
+    local n = r and (r.won + r.lost) or 0
+    if n >= MIN_TRIES and (not bestEV or r.units / n > bestEV) then best, bestEV = p, r.units / n end
   end
-  return math.min(MAX_PCT, (DB.itemPct and DB.itemPct[id]) or DB.buyPct or BUY_PCT)
+  return best, bestEV
+end
+
+-- The Buy % an item uses with Explore off, and why: its proven best, else
+-- the one you set for it, else your general Buy %.
+local function SavedPct(id)
+  local best = BestPct(id)
+  if best then return math.min(MAX_PCT, best), "best" end
+  local own = DB.itemPct and DB.itemPct[id]
+  if own then return math.min(MAX_PCT, own), "item" end
+  return math.min(MAX_PCT, DB.buyPct or BUY_PCT), "general"
+end
+
+-- Explore: give every Buy % MIN_TRIES tries first (least tried first). Once
+-- they all have them, use the best and only test another one try in
+-- EXPLORE_EVERY, so it settles instead of rotating forever.
+local EXPLORE_EVERY = 5
+local function PickPct(id)
+  if not (DB.explore and id) then return (SavedPct(id)) end
+  if nextPct[id] then return nextPct[id] end
+  local t = DB.tune and DB.tune[id] or {}
+  local function n(p) local r = t[p] return r and (r.won + r.lost) or 0 end
+  local pick, pickN, total = nil, nil, 0
+  for _, p in ipairs(PCTS) do
+    total = total + n(p)
+    if n(p) < MIN_TRIES and (not pick or n(p) < pickN or (n(p) == pickN and math.random() < 0.5)) then pick, pickN = p, n(p) end
+  end
+  if not pick then
+    local best = BestPct(id)
+    pick = best
+    if total % EXPLORE_EVERY == 0 then
+      for _, p in ipairs(PCTS) do
+        if p ~= best and (pick == best or n(p) < n(pick)) then pick = p end
+      end
+    end
+  end
+  nextPct[id] = pick
+  return pick
 end
 
 -- Record one attempt against Buy % and hour of day.
@@ -253,23 +289,6 @@ local function Tally(id, won, qty, total)
     end
   end
   if wb_AHSnipe_TuneRefresh then wb_AHSnipe_TuneRefresh() end
-end
-
--- " @50%" after a buy result: the Buy % that attempt used.
-local function PctNote(id)
-  local p = id and attemptPct[id]
-  return p and (" |cff888888@" .. p .. "%|r") or ""
-end
-
--- "60% 3/5" for this session, colored by how often you win.
-local function WinCell(id, dim)
-  local r = id and session[id]
-  if not r or r.won + r.lost == 0 then return "" end
-  local n = r.won + r.lost
-  local pct = math.floor(100 * r.won / n + 0.5)
-  local color = pct >= 60 and "|cff55ff55" or pct >= 30 and "|cffffd100" or "|cffff5555"
-  local t = color .. pct .. "%|r |cffaaaaaa" .. r.won .. "/" .. n .. "|r"
-  return dim and Dim(t) or t
 end
 
 -- /snipe stats: one line per item, best win rate first.
@@ -312,7 +331,7 @@ end
 
 local function Fail(qty, item, why)
   Tally(item, false)
-  Row({ "|cffff5555Failed|r", qty and ("|cffff5555" .. qty .. "|r") or "", item and Dim(ItemText(item)) or "", "", GREY .. why .. "|r", MaxCell(item, true), WinCell(item) .. PctNote(item) })
+  Row({ "|cffff5555Failed|r", "", item and Dim(ItemText(item)) or "", "", GREY .. why .. "|r" })
 end
 
 -- Log ----------------------------------------------------------------------
@@ -597,8 +616,7 @@ end
 
 local function OverMax(itemID)
   overCount = overCount + 1
-  if overCount >= BackLimit() and lastBrowse == "fav" and DB.roam ~= false and DB.pin ~= itemID
-     and not (DB.baitOn and DB.baitOn[itemID]) then
+  if overCount >= BackLimit() and lastBrowse == "fav" and DB.pin ~= itemID then
     L("auto_back", { item = itemID, presses = overCount, empty = sawUnder and 0 or 1 })
     overCount = 0
     wb_AHSnipe_Favorites()
@@ -649,77 +667,6 @@ end
 -- afford) and ask the server for a quote on that amount.
 -- Press 2: buy it, if the quote still fits under your max.
 -- If the list is out of date, a press refreshes it instead.
-
--- Your own bait ---------------------------------------------------------------
--- An experiment: keep 1 unit of an item listed at your max, so sellers who
--- undercut the lowest listing post their stacks just under it, where you can
--- snipe them. Posting needs a key press, so it's one of the things a Snipe
--- press does: only when that press would otherwise just refresh, nothing else
--- is waiting at the AH, and no one's listing is already at or under your
--- price. Turned on per item with the Bait checkbox on the Snipe tab.
-do
-  local BAIT_EVERY = 60  -- seconds between posts of the same item
-  local BAIT_MAX = 10    -- posts per item per session, to cap the cost
-  local lastPost, posts = {}, {}
-
-  -- First bag slot holding this item.
-  local function FindInBags(id)
-    local C = C_Container
-    for bag = 0, 4 do
-      local n = (C and C.GetContainerNumSlots or GetContainerNumSlots)(bag) or 0
-      for slot = 1, n do
-        local sid = (C and C.GetContainerItemID or GetContainerItemID)(bag, slot)
-        if sid == id then return bag, slot end
-      end
-    end
-  end
-
-  -- Lowest listing at all, and whether one of yours is at or under the price.
-  local function Lowest(id, price)
-    local low, mine = nil, false
-    for i = 1, C_AuctionHouse.GetNumCommoditySearchResults(id) or 0 do
-      local r = C_AuctionHouse.GetCommoditySearchResultInfo(id, i)
-      if not r then break end
-      if not low then low = r.unitPrice end
-      if r.unitPrice > price then break end
-      if (r.numOwnerItems or 0) > 0 then mine = true end
-    end
-    return low, mine
-  end
-
-  -- What bait would do on this press: nil (off), or a status table.
-  function wb_AHSnipe_BaitStatus(id, cap)
-    if not (id and cap and DB.baitOn and DB.baitOn[id]) then return end
-    local low, mine = Lowest(id, cap)
-    local st = { price = cap, mine = mine, low = low, posts = posts[id] or 0 }
-    if mine then st.state = "listed"
-    elseif low and low <= cap then st.state = "covered" -- someone else's listing is already that low
-    elseif (posts[id] or 0) >= BAIT_MAX then st.state = "limit"
-    elseif lastPost[id] and GetTime() - lastPost[id] < BAIT_EVERY then st.state = "wait"; st.inSec = math.ceil(BAIT_EVERY - (GetTime() - lastPost[id]))
-    elseif not FindInBags(id) then st.state = "nobags"
-    else st.state = "post" end
-    return st
-  end
-
-  -- Called from a Snipe press that would otherwise refresh. Returns true if it posted.
-  function wb_AHSnipe_TryBait(id, cap)
-    local st = wb_AHSnipe_BaitStatus(id, cap)
-    if not st or st.state ~= "post" then return false end
-    if not (C_AuctionHouse.PostCommodity and ItemLocation and ItemLocation.CreateFromBagAndSlot) then return false end
-    local bag, slot = FindInBags(id)
-    local loc = ItemLocation:CreateFromBagAndSlot(bag, slot)
-    local ok, err = pcall(C_AuctionHouse.PostCommodity, loc, 1, 1, cap) -- 12h, 1 unit, at your max
-    lastPost[id] = GetTime()
-    if not ok then
-      L("bait_error", { item = id, err = tostring(err) })
-      return false
-    end
-    posts[id] = (posts[id] or 0) + 1
-    L("bait_post", { item = id, price = cap, n = posts[id] })
-    msg("Posted bait: 1 " .. ItemText(id) .. " at " .. Coins(cap) .. " |cff888888(" .. posts[id] .. " of " .. BAIT_MAX .. " this session)|r")
-    return true
-  end
-end
 
 local function BuyCommodity()
   local itemID = OpenItemID()
@@ -804,10 +751,6 @@ local function BuyCommodity()
   end
   local listAge = ms(now - (resultsAt[itemID] or now))
 
-  if qty == 0 and not pending and wb_AHSnipe_TryBait(itemID, cap) then
-    L("press", { step = "bait_posted", item = itemID })
-    return
-  end
   if qty == 0 then
     if OverMax(itemID) then return end
     local r = C_AuctionHouse.GetCommoditySearchResultInfo(itemID, 1)
@@ -818,10 +761,6 @@ local function BuyCommodity()
 
   local minQty = math.max(2, DB.minQty or MIN_QTY) -- 1 cheap unit is always bait
   local baitBuy = false
-  if qty < minQty and not pending and wb_AHSnipe_TryBait(itemID, cap) then
-    L("press", { step = "bait_posted", item = itemID })
-    return
-  end
   if qty < minQty then
     overCount = 0 -- bait under max: stay parked
     baitPresses = baitPresses + 1
@@ -877,12 +816,7 @@ function wb_AHSnipe_Buy()
   elseif ah.CommoditiesBuyFrame and ah.CommoditiesBuyFrame:IsShown() then
     BuyCommodity()
   else
-    -- Jump is off: ask once per AH visit whether to turn it on.
-    if lastBrowse == "fav" and DB.roam == false and not wb_AHSnipe_RoamAsked then
-      wb_AHSnipe_RoamAsked = true
-      StaticPopup_Show("WBAHSNIPE_ROAM")
-    end
-    if lastBrowse == "fav" and DB.roam ~= false then
+    if lastBrowse == "fav" then
       local deals = Deals()
       if #deals > 0 then
         if Queued() or buying or pending then L("press", { step = "jump_wait", deals = #deals }) return end
@@ -952,6 +886,7 @@ local function BuyProfit(id, qty, total)
   if not each or not total then return "|cff888888?|r", SessionCell() end
   local p = qty * each * (1 - AH_CUT_PCT / 100) - total
   sess.profit = sess.profit + p
+  if session[id] then session[id].profit = (session[id].profit or 0) + p end
   return GoldText(p), SessionCell()
 end
 function wb_AHSnipe_SessionRate()
@@ -961,7 +896,6 @@ end
 
 f:SetScript("OnEvent", function(_, e, arg1, arg2)
   if e == "AUCTION_HOUSE_SHOW" then sess.openAt = sess.openAt or GetTime() end
-  if e == "AUCTION_HOUSE_CLOSED" then wb_AHSnipe_RoamAsked = nil end
   if e == "AUCTION_HOUSE_CLOSED" and sess.openAt then
     sess.ahTime = sess.ahTime + (GetTime() - sess.openAt)
     sess.openAt = nil
@@ -971,6 +905,8 @@ f:SetScript("OnEvent", function(_, e, arg1, arg2)
       wb_AHSnipeDB = wb_AHSnipeDB or {}
       wb_AHSnipeDB.caps = wb_AHSnipeDB.caps or {}
       DB = wb_AHSnipeDB
+      DB.roam = nil -- Jump is always on now; Stay is per item
+      DB.baitOn = nil -- posting your own bait was removed
     end
     return
   end
@@ -988,8 +924,7 @@ f:SetScript("OnEvent", function(_, e, arg1, arg2)
     if b then
       Tally(b.item, true, b.qty, b.total)
       local profit, hourly = BuyProfit(b.item, b.qty, b.total)
-      Row({ "|cffffd100Bought|r", "|cffffd100" .. b.qty .. "|r", ItemText(b.item), profit, hourly,
-        MaxCell(b.item), WinCell(b.item) .. PctNote(b.item) })
+      Row({ "|cffffd100Bought|r", "|cffffd100" .. b.qty .. "|r", ItemText(b.item), profit, hourly })
     else
       msg("|cffffd100Bought.|r")
     end
@@ -1007,7 +942,7 @@ f:SetScript("OnEvent", function(_, e, arg1, arg2)
     if bidding then
       Tally(bidding.item, true, 1, bidding.price)
       local profit, hourly = BuyProfit(bidding.item, 1, bidding.price)
-      Row({ "|cffffd100Bought|r", "|cffffd1001|r", ItemText(bidding.item), profit, hourly, MaxCell(bidding.item), WinCell(bidding.item) })
+      Row({ "|cffffd100Bought|r", "|cffffd1001|r", ItemText(bidding.item), profit, hourly })
       bidding = nil
     end
     return
@@ -1134,23 +1069,15 @@ local function ShowMax(b, v)
   end
 end
 
-StaticPopupDialogs["WBAHSNIPE_ROAM"] = {
-  text = "Jumping into favorites is off, so Snipe will only refresh your favorites list.\n\nTurn jumping on?",
-  button1 = "Turn on",
-  button2 = "Keep off",
-  OnAccept = function()
-    DB.roam = true
-    if settings and settings.roam then settings.roam:SetChecked(true) end
-    L("roam", { on = 1, via = "popup" })
-  end,
-  timeout = 0, whileDead = true, hideOnEscape = true, preferredIndex = 3,
-}
-
+-- Snipe always jumps into deals and back out when they're gone. Stay (per
+-- item) keeps it on one item. This toggles Stay for the open item; the name
+-- is kept so old keybinds and macros still work.
 function wb_AHSnipe_ToggleRoam()
-  DB.roam = not (DB.roam ~= false)
-  if settings and settings.roam then settings.roam:SetChecked(DB.roam) end
-  L("roam", { on = DB.roam and 1 or 0 })
-  msg("Jump in and out of favorites: " .. (DB.roam and "|cff55ff55on|r" or "|cffff5555off|r (staying put)"))
+  local id = OpenItemID()
+  if not id then msg("Open an item first.") return end
+  DB.pin = (DB.pin ~= id) and id or nil
+  L("pin", { item = id, on = DB.pin and 1 or 0 })
+  msg(DB.pin and ("Staying on " .. ItemText(id) .. ".") or ("Stay off for " .. ItemText(id) .. "."))
 end
 
 function wb_AHSnipe_Favorites()
@@ -1355,8 +1282,7 @@ end
 
 local function BackIn()
   if DB.pin and DB.pin == OpenItemID() then return "  Staying here (pinned)." end
-  if DB.baitOn and DB.baitOn[OpenItemID() or 0] then return "  Staying here (bait on)." end
-  if lastBrowse == "fav" and DB.roam ~= false then
+  if lastBrowse == "fav" then
     return "  Back to favorites in " .. math.max(1, BackLimit() - overCount) .. "."
   end
   return ""
@@ -1395,10 +1321,6 @@ local function NextPress()
     cap, nextTier = GapCap(id, cap)
     local under, afford, cheapest, n = Under(id, cap)
     if n == 0 then return "Loading listings", "", "wait" end
-    local bait = wb_AHSnipe_BaitStatus(id, cap)
-    if bait and bait.state == "post" and afford < math.max(2, DB.minQty or MIN_QTY) and not pending then
-      return "Post bait: 1 at " .. Coins(cap), "Your own bait, so undercutters post under it.", "go"
-    end
     if under == 0 then
       if cap < fullCap and cheapest and cheapest <= fullCap then
         return "No resale gap: refresh", "Next tier " .. Coins(nextTier) .. ", so buys at " .. Coins(cap) .. " or less." .. BackIn(), "idle"
@@ -1442,11 +1364,11 @@ local function NextPress()
   if lastBrowse == "fav" then
     if pending and now - sentAt < STALE_GUARD then return "Waiting for favorites", "", "wait" end
     local deals = Deals()
-    if #deals > 0 and DB.roam ~= false then
+    if #deals > 0 then
       local d = deals[1]
       return "Jump to " .. ItemText(d.id), Coins(d.price) .. ", max " .. Coins(d.cap) .. ". " .. #deals .. " under max.", "go"
     end
-    return "Refresh favorites", #deals > 0 and (#deals .. " under max, but Jump is off.") or "Nothing under max yet.", "idle"
+    return "Refresh favorites", "Nothing under max yet.", "idle"
   end
   return "Refresh search", "Open your favorites to snipe from them.", "idle"
 end
@@ -1512,13 +1434,47 @@ local function StatLine(label, r)
   return "|cffaaaaaa" .. label .. ":|r " .. color .. pct .. "%|r won |cff888888(" .. r.won .. " of " .. n .. ")|r" .. avg
 end
 
-local SNIPE_H, SETUP_H = 410, 384
+local SNIPE_H, SETUP_H = 220, 384
+local SNIPE_ITEM_H = 212 -- item card: name, max, one session line
+
+-- One line under the max: this item's session win rate and expected profit.
+local function SessionSummary(id)
+  local r = session[id]
+  local n = r and (r.won + r.lost) or 0
+  if n == 0 then return "|cffaaaaaaThis session:|r |cff888888no buys yet|r" end
+  local pct = math.floor(100 * r.won / n + 0.5)
+  local color = pct >= 60 and "|cff55ff55" or pct >= 30 and "|cffffd100" or "|cffff5555"
+  local t = "|cffaaaaaaThis session:|r " .. color .. pct .. "%|r won |cff888888(" .. r.won .. " of " .. n .. ")|r"
+  if (r.profit or 0) ~= 0 then t = t .. "  " .. GoldText(r.profit) end
+  return t
+end
+
+-- The item name's tooltip: what used to fill the card.
+function wb_AHSnipe_ItemDetails(id)
+  local out = {}
+  local pct, why = PickPct(id), nil
+  if DB.explore then why = "exploring"
+  else
+    local _, w = SavedPct(id)
+    why = w == "best" and "its best" or w == "item" and "set for it" or "general"
+  end
+  out[#out + 1] = "|cffaaaaaaBuy %:|r " .. pct .. "% |cff888888(" .. why .. ")|r"
+  out[#out + 1] = StatLine("All-time", DB.stats and DB.stats[id])
+  local m1, m2 = wb_AHSnipe_MarketLines(id)
+  if m1 and m1 ~= "" then out[#out + 1] = m1 end
+  if m2 and m2 ~= "" then out[#out + 1] = m2 end
+  local sold, min = SoldPerDay(id), DB.minSold or MIN_SOLD
+  out[#out + 1] = "|cffaaaaaaSold/day:|r " .. (sold and ((min > 0 and sold < min and "|cffff5555" or "|cffffffff") .. math.floor(sold + 0.5) .. "|r"
+    .. (min > 0 and (" |cff888888(min " .. min .. ")|r") or "")) or "|cff888888no TSM data|r")
+  out[#out + 1] = wb_AHSnipe_ProfitLine(id)
+  return out
+end
 
 -- Size the window for the tab that's showing.
 function wb_AHSnipe_Layout()
   if not settings then return end
   local t = settings.tab
-  if t == TAB.snipe then settings:SetSize(290, SNIPE_H)
+  if t == TAB.snipe then settings:SetSize(290, settings.snipeH or SNIPE_H)
   elseif t == TAB.sell then settings:SetSize(290, settings.sellH or 200)
   elseif t == TAB.setup then
     local res = settings.checkPanel and settings.checkPanel:IsShown()
@@ -1537,7 +1493,7 @@ local function BuildSnipePage(p)
   -- The open item
   local card = CreateFrame("Frame", nil, p)
   card:SetPoint("TOPLEFT", p, "TOPLEFT", 0, -92)
-  card:SetSize(290, 280)
+  card:SetSize(290, 110)
   card.name = Text(card, "GameFontHighlightLarge", 14, -2, nil, 196)
   -- Stay: Snipe never leaves this item for favorites until you uncheck it.
   local stay = CreateFrame("CheckButton", "wb_AHSnipeStay", card, "UICheckButtonTemplate")
@@ -1564,61 +1520,22 @@ local function BuildSnipePage(p)
   card.maxTag:SetPoint("LEFT", maxLabel, "RIGHT", 8, 0)
   card.max = MaxBoxes(card, "wb_AHSnipeMax", -42, function(b) SaveMax(b, OpenItemID()) end)
 
-  local pctLabel = Text(card, "GameFontNormal", 14, -88, "Buy %")
-  card.pctTag = card:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-  card.pctTag:SetPoint("LEFT", pctLabel, "RIGHT", 8, 0)
-  local pct = BigBox(card, "wb_AHSnipePctBox", 66, true, 36, 16)
-  pct:SetMaxLetters(3)
-  pct:SetPoint("TOPLEFT", card, "TOPLEFT", 16, -104)
-  pct:SetScript("OnEnterPressed", function(self)
-    local id = OpenItemID()
-    local txt = strtrim(self:GetText() or "")
-    local n = tonumber(txt)
-    if id and txt == "" then
-      if DB.itemPct then DB.itemPct[id] = nil end
-      msg(ItemText(id) .. " now uses your general Buy % (" .. (DB.buyPct or BUY_PCT) .. "%).")
-    elseif id and n and n >= 1 then
-      if n > MAX_PCT then n = MAX_PCT; msg("Buy % tops out at " .. MAX_PCT .. "% so the bait unit is never bought.") end
-      DB.itemPct = DB.itemPct or {}
-      DB.itemPct[id] = n
-      msg("Buy % for " .. ItemText(id) .. ": " .. n .. "%")
-    end
-    self:ClearFocus()
-  end)
-  pct:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-  card.pct = pct
-  card.pctNote = Text(card, "GameFontDisableSmall", 92, -110, nil, 186)
-  card.pctNote2 = Text(card, "GameFontDisableSmall", 92, -124, nil, 186)
+  card.session = Text(card, "GameFontHighlightSmall", 14, -88, nil, 262)
 
-  card.session = Text(card, "GameFontHighlightSmall", 14, -152, nil, 262)
-  card.alltime = Text(card, "GameFontHighlightSmall", 14, -168, nil, 262)
-  card.market = Text(card, "GameFontHighlightSmall", 14, -188, nil, 262)
-  card.market2 = Text(card, "GameFontHighlightSmall", 14, -204, nil, 262)
-  card.sold = Text(card, "GameFontHighlightSmall", 14, -220, nil, 262)
-  card.profit = Text(card, "GameFontHighlightSmall", 14, -236, nil, 262)
-
-  local bait = CreateFrame("CheckButton", "wb_AHSnipeBait", card, "UICheckButtonTemplate")
-  bait:SetSize(24, 24)
-  bait:SetPoint("TOPLEFT", card, "TOPLEFT", 10, -252)
-  local baitText = bait:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  baitText:SetPoint("LEFT", bait, "RIGHT", 2, 0)
-  baitText:SetText("Bait")
-  bait:SetScript("OnClick", function(self)
+  -- Everything else about the item: hover its name.
+  local hit = CreateFrame("Frame", nil, card)
+  hit:SetPoint("TOPLEFT", card, "TOPLEFT", 10, 0)
+  hit:SetSize(200, 20)
+  hit:EnableMouse(true)
+  hit:SetScript("OnEnter", function(self)
     local id = OpenItemID()
     if not id then return end
-    DB.baitOn = DB.baitOn or {}
-    DB.baitOn[id] = self:GetChecked() and true or nil
-    L("bait_toggle", { item = id, on = DB.baitOn[id] and 1 or 0 })
-  end)
-  bait:SetScript("OnEnter", function(self)
-    GameTooltip:SetOwner(self, "ANCHOR_TOP")
-    GameTooltip:SetText("Post your own bait")
-    GameTooltip:AddLine("Keeps 1 of this item listed at your max, so sellers who undercut the lowest price post their stacks just under it. Snipe posts it on a press that would otherwise just refresh (needs the item in your bags; at most once a minute and 10 times a session). You also stay on this item while it's on.", 1, 1, 1, true)
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+    GameTooltip:SetText(ItemText(id))
+    for _, line in ipairs(wb_AHSnipe_ItemDetails(id)) do GameTooltip:AddLine(line, 1, 1, 1) end
     GameTooltip:Show()
   end)
-  bait:SetScript("OnLeave", GameTooltip_Hide)
-  card.bait = bait
-  card.baitNote = Text(card, "GameFontDisableSmall", 70, -258, nil, 206)
+  hit:SetScript("OnLeave", GameTooltip_Hide)
   settings.card = card
 
   -- No item open: what's under max on your favorites
@@ -1630,18 +1547,6 @@ local function BuildSnipePage(p)
   for i = 1, 11 do favs.lines[i] = Text(favs, "GameFontHighlightSmall", 14, -10 - i * 17, nil, 262) end
   settings.favs = favs
 
-  local roam = CreateFrame("CheckButton", "wb_AHSnipeRoam", p, "UICheckButtonTemplate")
-  roam:SetSize(28, 28)
-  roam:SetPoint("TOPLEFT", p, "TOPLEFT", 12, -374)
-  local roamText = roam:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  roamText:SetPoint("LEFT", roam, "RIGHT", 4, 0)
-  roamText:SetText("Jump in and out of favorites")
-  roam:SetChecked(DB.roam ~= false)
-  roam:SetScript("OnClick", function(self)
-    DB.roam = self:GetChecked() and true or false
-    L("roam", { on = DB.roam and 1 or 0 })
-  end)
-  settings.roam = roam
 end
 
 local function BuildSetupPage(p)
@@ -1806,12 +1711,18 @@ local function UpdateSnipePage()
   local c = KIND_COLOR[kind] or KIND_COLOR.idle
   strip.text:SetText(text)
   strip.text:SetTextColor(c[1], c[2], c[3])
-  strip.detail:SetText(detail or "")
+  -- The detail line only explains a refresh or a block; buys and waits speak for themselves.
+  strip.detail:SetText((kind == "idle" or kind == "stop") and detail or "")
   strip:SetBackdropBorderColor(c[1] * 0.7, c[2] * 0.7, c[3] * 0.7, 1)
 
   local id = OpenItemID()
   card:SetShown(id and true or false)
   favs:SetShown(not id)
+  local h = id and SNIPE_ITEM_H or (92 + 30 + math.max(1, math.min(#favs.lines, #Deals())) * 17 + 14)
+  if h ~= settings.snipeH then
+    settings.snipeH = h
+    if settings.tab == TAB.snipe then settings:SetHeight(h) end
+  end
   if id then
     card.name:SetText(ItemText(id))
     card.stay:SetChecked(DB.pin == id)
@@ -1821,52 +1732,11 @@ local function UpdateSnipePage()
     if eff and (not set or eff < set) then
       card.maxTag:SetText("|cff55ff55TSM " .. (DB.tsmPct or TSM_PCT) .. "%: " .. Coins(eff) .. "|r")
     else
-      card.maxTag:SetText(own and "for this item" or (DB.default and "using your default" or "none set"))
+      card.maxTag:SetText((own or DB.default) and "" or "none set")
     end
     ShowMax(card.max, set)
 
-    local pct = card.pct
-    if DB.explore then
-      if pct:HasFocus() then pct:ClearFocus() end
-      pct:Disable()
-      local ep = PickPct(id)
-      pct:SetText(tostring(ep))
-      pct:SetTextColor(0.33, 1, 0.33)
-      card.pctTag:SetText("exploring")
-      card.pctNote:SetText("Trying " .. ep .. "% next (try " .. (Tries(id, ep) + 1) .. ").")
-      card.pctNote2:SetText("Turn Explore off in Setup to set it.")
-    else
-      if not pct:IsEnabled() then pct:Enable(); pct:SetTextColor(1, 1, 1) end
-      local ownPct = DB.itemPct and DB.itemPct[id]
-      if not pct:HasFocus() then pct:SetText(tostring(math.min(MAX_PCT, ownPct or DB.buyPct or BUY_PCT))) end
-      card.pctTag:SetText(ownPct and "for this item" or "using general")
-      card.pctNote:SetText("Share of the cheap units to buy.")
-      card.pctNote2:SetText(ownPct and "Clear it to use your general %." or "")
-    end
-    card.session:SetText(StatLine("This session", session[id]))
-    card.alltime:SetText(StatLine("All-time", DB.stats and DB.stats[id]))
-    local m1, m2 = wb_AHSnipe_MarketLines(id)
-    card.market:SetText(m1)
-    card.market2:SetText(m2)
-    card.profit:SetText(wb_AHSnipe_ProfitLine(id))
-    local on = DB.baitOn and DB.baitOn[id]
-    card.bait:SetChecked(on and true or false)
-    local bs = on and wb_AHSnipe_BaitStatus(id, Cap(id))
-    local NOTES = {
-      listed = "|cff55ff55yours is listed|r", covered = "someone's listing is already that low",
-      limit = "|cffff555510 posts this session|r", nobags = "|cffff5555none in your bags|r", post = "posts on your next press",
-    }
-    card.baitNote:SetText(not on and "1 at your max, to lure undercutters"
-      or (bs and (bs.state == "wait" and ("next post in " .. bs.inSec .. "s") or NOTES[bs.state])) or "")
-    local sold, min = SoldPerDay(id), DB.minSold or MIN_SOLD
-    if not sold then
-      card.sold:SetText("|cffaaaaaaSold/day:|r |cff888888no TSM data|r")
-    else
-      local ok = min <= 0 or sold >= min
-      card.sold:SetText("|cffaaaaaaSold/day:|r " .. (ok and "|cffffffff" or "|cffff5555") .. tostring(math.floor(sold + 0.5)) .. "|r"
-        .. (min > 0 and (" |cff888888(min " .. min .. ")|r") or "")
-        .. ((TSM_API and TSM_API.GetCustomPriceValue) and " |cff888888TSM region|r" or " |cff888888TSM snapshot|r"))
-    end
+    card.session:SetText(SessionSummary(id))
   else
     local lines = favs.lines
     for i = 1, #lines do lines[i]:SetText("") end
@@ -1884,7 +1754,6 @@ local function UpdateSnipePage()
       end
     end
   end
-  settings.roam:SetChecked(DB.roam ~= false)
 end
 
 local function UpdateSetupPage()
@@ -2184,15 +2053,8 @@ lg:SetScript("OnEvent", function(_, e, a1, a2)
       end
     end
     if under > 0 and a1 == OpenItemID() then sawUnder = true end
-    local ownBait = 0
-    for i = 1, n do
-      local r = C_AuctionHouse.GetCommoditySearchResultInfo(a1, i)
-      if not r or (cap and r.unitPrice > cap) then break end
-      if (r.numOwnerItems or 0) > 0 then ownBait = 1 break end
-    end
     L(short, { item = a1, latency = ms(now - sentAt), top = table.concat(top, " "), cap = cap,
-      listings = n, underQty = under, underListings = underListings, jumped = jumped,
-      baitOn = DB.baitOn and DB.baitOn[a1] and 1 or nil, ownBait = ownBait })
+      listings = n, underQty = under, underListings = underListings, jumped = jumped })
   elseif e == "ITEM_SEARCH_RESULTS_UPDATED" then
     local key = a1
     local id = key and key.itemID
@@ -2305,10 +2167,9 @@ local function SnapFavorites()
         local name = (wb_AHSnipeLog.names[id]) or C_Item.GetItemNameByID(id) or ("item " .. id)
         local n = math.floor(math.abs(pct) * 100 + 0.5)
         local tag = pct < 0 and ("|cff33ff33-" .. n .. "%|r") or ("|cffff5555+" .. n .. "%|r")
-        if pct > 0 then
-          -- Price went up: not actionable, so keep it quiet.
-          Row({ tag, "", Dim(ItemText(id)), Dim(Coins(price)), Dim("(was " .. Coins(old) .. ")"), MaxCell(id, true) })
-        else
+        -- Only drops to under your max get a line: those are the ones you can act on.
+        local cap = Cap(id)
+        if pct < 0 and cap and price <= cap then
           Row({ tag, "", ItemText(id), Coins(price), "|cffaaaaaa(was|r " .. Coins(old) .. "|cffaaaaaa)|r", MaxCell(id) })
         end
         L("fav_move", { item = id, old = old, new = price, pct = math.floor(pct * 1000 + 0.5) / 10 })
@@ -3074,9 +2935,7 @@ end)
 -- For each item: win rate and units won per try at each Buy % tested.
 -- "Best" = the most units won per try (with at least MIN_TRIES tries), since a
 -- small sure win and a big risky one are both worth something.
--- /snipe tune apply saves each item's best as its own Buy %.
-
-local MIN_TRIES = 4
+-- With Explore off each item uses its best automatically.
 
 function wb_AHSnipe_Tune(apply)
   local tune = DB.tune or {}
@@ -3115,7 +2974,7 @@ function wb_AHSnipe_Tune(apply)
       end
     end
     msg(cell(TruncateChars(ItemText(id), 20), 20) .. " " .. table.concat(parts, ""))
-    local cur = (DB.itemPct and DB.itemPct[id]) or DB.buyPct or BUY_PCT
+    local cur = PickPct(id)
     local line
     if best then
       line = ("    best |cffffd100%d%%|r (%.1f units per try)"):format(best, bestEV)
@@ -3149,9 +3008,9 @@ function wb_AHSnipe_Tune(apply)
     msg("|cffaaaaaaBest hours so far:|r " .. table.concat(hs, ", "))
   end
   if apply then
-    msg(applied > 0 and ("Saved Buy % for " .. applied .. " items. Turn off Explore to use them.") or "Nothing to save yet.")
+    msg(applied > 0 and ("Saved Buy % for " .. applied .. " items.") or "Nothing to save yet.")
   elseif not DB.explore then
-    msg("|cffaaaaaaTurn on Explore Buy % to keep testing, or /snipe tune apply to save the bests.|r")
+    msg("|cffaaaaaaExplore is off: each item uses its best, or your general Buy % until it has one.|r")
   end
 end
 
@@ -3185,7 +3044,7 @@ local function TuneData()
   return out
 end
 
-local function Using(id) return (DB.itemPct and DB.itemPct[id]) or DB.buyPct or BUY_PCT end
+local function Using(id) return SavedPct(id) end
 
 function wb_AHSnipe_TuneApplyAll()
   local n = 0
@@ -3225,22 +3084,12 @@ local function RenderTune()
     tuneWin.hours = tuneWin:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     tuneWin.hours:SetJustifyH("LEFT")
 
-    local all = CreateFrame("Button", nil, tuneWin, "UIPanelButtonTemplate")
-    all:SetSize(170, 24); all:SetPoint("BOTTOMLEFT", 14, 12); all:SetText("Use best for all items")
-    all:SetScript("OnEnter", function(self)
-      GameTooltip:SetOwner(self, "ANCHOR_TOP")
-      GameTooltip:SetText("Use best for all items")
-      GameTooltip:AddLine("Saves each item's best Buy % (marked *) as that item's own Buy %. Items without enough tries keep your general Buy %.", 1, 1, 1, true)
-      GameTooltip:Show()
-    end)
-    all:SetScript("OnLeave", GameTooltip_Hide)
-    all:SetScript("OnClick", function() wb_AHSnipe_TuneApplyAll(); RenderTune() end)
     tuneWin.rows = {}
   end
 
   local data = TuneData()
   local n = math.max(1, #data)
-  settings:SetSize(720, 164 + n * 22)
+  settings:SetSize(720, 136 + n * 22)
 
   for i, row in ipairs(data) do
     local r = tuneWin.rows[i]
@@ -3276,11 +3125,11 @@ local function RenderTune()
       end
       if DB.explore and c.p == nextUp then fs:SetText("|cff55ff55>|r" .. fs:GetText()) end
     end
-    local using = DB.explore and nextUp or Using(row.id)
+    local using, why = Using(row.id)
     r.best:SetText(row.best and ("|cffffd100" .. row.best .. "%|r") or "|cff666666-|r")
-    r.using:SetText(DB.explore and ("|cff55ff55" .. using .. "% next|r")
-      or (using .. "%" .. ((DB.itemPct and DB.itemPct[row.id]) and "" or " |cff888888(all)|r")))
-    r.set:SetShown(row.best and row.best ~= Using(row.id) or false)
+    r.using:SetText(DB.explore and ("|cff55ff55" .. nextUp .. "% next|r")
+      or (using .. "%" .. (why == "general" and " |cff888888(all)|r" or why == "item" and " |cff888888(set)|r" or "")))
+    r.set:Hide()
     if row.best then r.set:SetText("Use " .. row.best .. "%") end
     r.set:SetScript("OnEnter", function(self)
       GameTooltip:SetOwner(self, "ANCHOR_TOP")
@@ -3304,9 +3153,9 @@ local function RenderTune()
     tuneWin.note:SetText("No Buy % data yet. Turn on |cffffd100Explore|r in the Setup tab and snipe as usual.")
   else
     tuneWin.note:SetText("Each cell: win rate, then tries.  |cffffd100*|r = best (most units won per try, "
-      .. MIN_TRIES .. "+ tries).\nUsing = the Buy % this item uses now; (all) = your general Buy % from the Setup tab.  |cff55ff55>|r = the Buy % Explore tries next.\n"
-      .. (DB.explore and "|cff55ff55Explore is on:|r it keeps rotating Buy % to learn. Turn it off to use the saved values."
-                     or "Explore is off: each item uses its saved Buy %, or your general one."))
+      .. MIN_TRIES .. "+ tries).\nUsing = the Buy % this item uses now: its best, or (all) your general Buy % until it has one.  |cff55ff55>|r = the Buy % Explore tries next.\n"
+      .. (DB.explore and ("|cff55ff55Explore is on:|r it tries each Buy % " .. MIN_TRIES .. " times, then sticks to the best and tests another 1 try in " .. EXPLORE_EVERY .. ".")
+                     or "Explore is off: each item uses its best. Nothing new is tested."))
   end
 
   local hours = {}
