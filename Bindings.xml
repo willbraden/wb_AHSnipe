@@ -4,4 +4,5 @@
   <Binding name="WBAHSNIPE_FAVS" category="ADDONS">wb_AHSnipe_Favorites()</Binding>
   <Binding name="WBAHSNIPE_CHECK" category="ADDONS">wb_AHSnipe_Check()</Binding>
   <Binding name="WBAHSNIPE_ROAM" category="ADDONS">wb_AHSnipe_ToggleRoam()</Binding>
+  <Binding name="WBAHSNIPE_SELL" category="ADDONS">wb_AHSnipe_SellPress()</Binding>
 </Bindings>

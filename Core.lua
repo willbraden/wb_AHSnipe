@@ -8,6 +8,7 @@ BINDING_NAME_WBAHSNIPE_FAVS = "Refresh favorites"
 BINDING_NAME_WBAHSNIPE_CHECK = "Check prices (one favorite per press)"
 BINDING_NAME_WBAHSNIPE_ROAM = "Toggle Stay on the open item"
 BINDING_NAME_WBAHSNIPE_BUY = "Snipe (one button: refresh, quote, buy)"
+BINDING_NAME_WBAHSNIPE_SELL = "Sell next sniped item (works on any AH tab)"
 
 local MIN_GAP = 0.6      -- seconds between searches
 local STALE_GUARD = 8    -- forget our own pending flag after this long
@@ -804,6 +805,10 @@ function wb_AHSnipe_Buy()
   local ah = AH()
   if not ah then return end
   if wb_AHSnipe_Checking then return end
+  if wb_AHSnipe_SellMode and wb_AHSnipe_SellMode() then
+    if wb_AHSnipe_SellPress then wb_AHSnipe_SellPress() end
+    return
+  end
   if wb_AHSnipe_StaleBlock and wb_AHSnipe_StaleBlock() then return end
   local now = GetTime()
   local view = (ah.ItemBuyFrame and ah.ItemBuyFrame:IsShown() and "item")
@@ -1838,18 +1843,18 @@ local function CheckSlowFavorites()
   if lastBrowse ~= "fav" or not DB then return end
   local min = DB.minSold or MIN_SOLD
   if min <= 0 or not (TSM_API and TSM_API.GetCustomPriceValue or type(wb_AHSnipe_Snapshot) == "table") then return end
-  local slow, unknown, sig = {}, {}, { min }
+  -- Each item is named once per session (again only if you change Min sold/day),
+  -- since the favorites page reloads with items coming and going.
+  if not slowSaid or slowSaid.min ~= min then slowSaid = { min = min } end
+  local slow, unknown = {}, {}
   for _, r in ipairs(C_AuctionHouse.GetBrowseResults() or {}) do
     local id = r.itemKey and r.itemKey.itemID
-    if id and IsFav(r.itemKey) then
+    if id and IsFav(r.itemKey) and not slowSaid[id] then
       local sold = SoldPerDay(id)
-      if not sold then unknown[#unknown + 1] = id; sig[#sig + 1] = id .. "?"
-      elseif sold < min then slow[#slow + 1] = { id = id, sold = sold }; sig[#sig + 1] = id end
+      if not sold then unknown[#unknown + 1] = id; slowSaid[id] = true
+      elseif sold < min then slow[#slow + 1] = { id = id, sold = sold }; slowSaid[id] = true end
     end
   end
-  local key = table.concat(sig, ",")
-  if key == slowSaid then return end
-  slowSaid = key
   if #slow == 0 and #unknown == 0 then return end
   table.sort(slow, function(a, b) return a.sold < b.sold end)
   if #slow > 0 then
@@ -3257,7 +3262,13 @@ local function BuildSellPanel()
     tinsert(sellPanel.labels, l)
     return Line("GameFontHighlight", 2)
   end
-  sellPanel.item = Line("GameFontHighlightLarge", 0)
+  sellPanel.next = Line("GameFontHighlight", 0)
+  sellPanel.nextDetail = Line("GameFontDisableSmall", 2)
+  sellPanel.listHead = Line("GameFontNormalSmall", 12)
+  sellPanel.listHead:SetText("Sniped items in your bags")
+  sellPanel.list = Line("GameFontHighlightSmall", 4)
+  sellPanel.list:SetSpacing(4)
+  sellPanel.item = Line("GameFontHighlightLarge", 16)
   sellPanel.session = Labeled("Bought this session")
   sellPanel.alltime = Labeled("Bought all-time")
   sellPanel.realized = Labeled("Sold so far")
@@ -3269,14 +3280,29 @@ local function Avg(r) return r and r.units and r.units > 0 and (r.spent / r.unit
 
 function wb_AHSnipe_SellShown() return SellFrame() ~= nil end
 
+-- The Snipe key sells when the AH's Sell tab is open, or when you pick the
+-- Sell tab in the Snipe window (so you can sell from the AH's Buy tab).
+function wb_AHSnipe_SellMode()
+  return SellFrame() ~= nil or (settings and settings:IsShown() and settings.tab == 2) or false
+end
+
 local function UpdateSellPanel()
   if not settings then return end
   if not sellPanel then BuildSellPanel() end
   local f = SellFrame()
   local id = f and SellItemID(f)
+  if wb_AHSnipe_SellNext then
+    local text, detail, kind = wb_AHSnipe_SellNext()
+    local color = kind == "go" and "|cff55ff55" or kind == "stop" and "|cffff5555" or kind == "wait" and "|cffffd100" or "|cff999999"
+    sellPanel.next:SetText(color .. text .. "|r")
+    sellPanel.nextDetail:SetText(detail or "")
+    local lines = wb_AHSnipe_SellLines()
+    sellPanel.listHead:SetShown(#lines > 0)
+    sellPanel.list:SetText(#lines > 0 and table.concat(lines, "\n") or "")
+  end
   for _, l in ipairs(sellPanel.labels) do l:SetShown(id and true or false) end
   if not id then
-    sellPanel.item:SetText("|cffaaaaaaPut an item in the AH's Sell slot to compare what you paid with your price.|r")
+    sellPanel.item:SetText("")
     for _, k in ipairs({ "session", "alltime", "realized", "selling", "profit" }) do sellPanel[k]:SetText("") end
   else
     local s, a = session[id], DB.stats and DB.stats[id]
@@ -3318,3 +3344,222 @@ local function UpdateSellPanel()
   end
 end
 wb_AHSnipe_UpdateSell = UpdateSellPanel
+
+-- One-button selling -----------------------------------------------------------
+-- On the AH's Sell tab, the Snipe key sells what you sniped, one item at a
+-- time: the first press searches the item, the next posts it at the price
+-- worked out from that list. Only items you bought with Snipe are offered,
+-- and nothing is posted under what you paid. Posting needs a key press, the
+-- same as buying, and nothing is sent while another AH message is waiting.
+-- Wrapped in a function so its locals don't count toward the file's 200 limit.
+;(function()
+  local SELL_HOURS = 3      -- aim to sell within this many hours
+  local BAIT_UNITS = 20     -- ignore the cheapest listings until this many units: those are bait
+  local MIN_PROFIT = 0.05   -- never post under what you paid plus this much, after the cut and deposit
+  local DURATION = 1        -- 12 hour auctions: cheapest deposit, and SELL_HOURS is well inside it
+  local RESULT_TTL = 10     -- seconds a searched list is trusted for posting
+  local SEARCH_TIMEOUT = 5
+  local sell = { done = {}, plans = {} } -- done[id] = "posted"/"held" this AH visit
+  local searching -- { id, at }
+
+  local function BagSlot(id)
+    local last = math.max(5, NUM_TOTAL_EQUIPPED_BAG_SLOTS or 4)
+    for bag = 0, last do
+      for slot = 1, (C_Container.GetContainerNumSlots(bag) or 0) do
+        local info = C_Container.GetContainerItemInfo(bag, slot)
+        if info and info.itemID == id and not info.isLocked then return bag, slot end
+      end
+    end
+  end
+
+  -- What you paid each: this session's average, else all-time.
+  local function Cost(id)
+    local s, a = session[id], DB.stats and DB.stats[id]
+    return Avg(s) or Avg(a)
+  end
+
+  -- Sniped items in your bags, most valuable stack first.
+  local function SellList()
+    local seen, out = {}, {}
+    local last = math.max(5, NUM_TOTAL_EQUIPPED_BAG_SLOTS or 4)
+    for bag = 0, last do
+      for slot = 1, (C_Container.GetContainerNumSlots(bag) or 0) do
+        local info = C_Container.GetContainerItemInfo(bag, slot)
+        local id = info and info.itemID
+        if id and not seen[id] and Cost(id) then
+          seen[id] = true
+          local n = C_Item.GetItemCount and C_Item.GetItemCount(id) or GetItemCount(id)
+          out[#out + 1] = { id = id, count = n, value = n * Cost(id) }
+        end
+      end
+    end
+    table.sort(out, function(a, b) return a.value > b.value end)
+    return out
+  end
+
+  local function Deposit(id, qty)
+    local ok, d = pcall(C_AuctionHouse.CalculateCommodityDeposit, id, DURATION, qty)
+    return ok and d or 0
+  end
+
+  -- The price for one item from its fresh search results:
+  -- the highest price that still has under SELL_HOURS of other sellers'
+  -- units ahead of it, never below what you paid plus MIN_PROFIT.
+  local function Plan(id)
+    local cost = Cost(id)
+    local tiers = {}
+    for i = 1, C_AuctionHouse.GetNumCommoditySearchResults(id) do
+      local r = C_AuctionHouse.GetCommoditySearchResultInfo(id, i)
+      if r then
+        local q = r.quantity - (r.numOwnerItems or 0)
+        if q > 0 then tiers[#tiers + 1] = { p = r.unitPrice, q = q } end
+      end
+    end
+    local bag, slot = BagSlot(id)
+    if not bag then return { id = id, state = "gone" } end
+    local loc = ItemLocation:CreateFromBagAndSlot(bag, slot)
+    local okc, qty = pcall(C_AuctionHouse.GetAvailablePostCount, loc)
+    qty = okc and qty or 0
+    if qty < 1 then return { id = id, state = "gone" } end
+    local floor = math.ceil((cost * (1 + MIN_PROFIT) + Deposit(id, qty) / qty) / (1 - AH_CUT))
+
+    local plan = { id = id, qty = qty, cost = cost, floor = floor, at = GetTime() }
+    if #tiers == 0 then
+      -- Nobody else selling: post at the usual market, or TSM's sale average.
+      local m = wb_AHSnipe_MarketInfo(id)
+      local ref = (m and m.usual) or TSMValue("DBRegionSaleAvg", id)
+      if not ref then plan.state, plan.why = "hold", "no listings and no market price" return plan end
+      plan.price, plan.why = math.max(floor, math.floor(ref)), "no one else is selling"
+    else
+      local sold = SoldPerDay(id)
+      local room = sold and (sold * SELL_HOURS / 24) or 0
+      -- Skip bait: the first BAIT_UNITS units don't set the price.
+      local ahead, pick = 0, nil
+      for k, t in ipairs(tiers) do
+        if ahead + t.q >= BAIT_UNITS or k == #tiers then
+          if not pick then pick = k end
+          if sold and ahead <= room then pick = k else break end
+        end
+        ahead = ahead + t.q
+      end
+      local price = tiers[pick].p - 1
+      local under = 0
+      for k = 1, pick - 1 do under = under + tiers[k].q end
+      plan.price, plan.ahead = price, under
+      plan.hours = sold and sold > 0 and (under / (sold / 24)) or nil
+    end
+    if plan.price < floor then
+      plan.state, plan.why = "hold", "under what you paid"
+    else
+      plan.state = "post"
+    end
+    -- A low hour doesn't stop the sale; it's shown so you can wait if you like.
+    local m = wb_AHSnipe_MarketInfo(id)
+    if m and m.usual and m.now and m.hours >= 4 and m.now < m.usual * 0.9 then
+      plan.lowHour = { pct = math.floor(100 * m.now / m.usual + 0.5), best = m.hi }
+    end
+    return plan
+  end
+
+  -- The next item to work on: the current plan's item, else the first one
+  -- not yet posted or held this visit.
+  local function NextItem()
+    for _, it in ipairs(SellList()) do
+      if not sell.done[it.id] then return it end
+    end
+  end
+
+  local function Busy()
+    return Queued() or buying or (searching and GetTime() - searching.at < SEARCH_TIMEOUT)
+      or not C_AuctionHouse.IsThrottledMessageSystemReady()
+  end
+
+  -- What the next press does: text, detail, kind (same as the Snipe tab).
+  function wb_AHSnipe_SellNext()
+    if searching and GetTime() - searching.at < SEARCH_TIMEOUT then return "Searching " .. ItemText(searching.id), nil, "wait" end
+    if Queued() or buying then return "Waiting for the AH", nil, "wait" end
+    local it = NextItem()
+    if not it then return "Nothing to sell", "Only items you sniped are offered.", "idle" end
+    local p = sell.plans[it.id]
+    if p and GetTime() - p.at < RESULT_TTL then
+      if p.state == "post" then return "Post " .. p.qty .. " " .. ItemText(it.id) .. " at " .. Coins(p.price), nil, "go" end
+      return "Skip " .. ItemText(it.id), "Held: " .. (p.why or ""), "stop"
+    end
+    return "Search " .. ItemText(it.id), it.count .. " in your bags", "idle"
+  end
+
+  function wb_AHSnipe_SellPress()
+    if not AH() then return end
+    if Busy() then L("sell_press", { step = "busy" }) return end
+    local it = NextItem()
+    if not it then L("sell_press", { step = "nothing" }) return end
+    local id = it.id
+    local p = sell.plans[id]
+    if p and GetTime() - p.at < RESULT_TTL then
+      if p.state ~= "post" then
+        sell.done[id] = "held"
+        L("sell_hold", { item = id, why = p.why, price = p.price, floor = p.floor })
+        return
+      end
+      local bag, slot = BagSlot(id)
+      if not bag then sell.done[id] = "held" return end
+      local loc = ItemLocation:CreateFromBagAndSlot(bag, slot)
+      local ok, err = pcall(C_AuctionHouse.PostCommodity, loc, DURATION, p.qty, p.price)
+      L("sell_post", { item = id, qty = p.qty, price = p.price, floor = p.floor, cost = math.floor(p.cost),
+        ahead = p.ahead, hours = p.hours and math.floor(p.hours * 10 + 0.5) / 10, ok = ok and 1 or 0, err = err })
+      if ok then
+        sell.done[id], sell.plans[id] = "posted", nil
+        local net = p.price * (1 - AH_CUT) - p.cost
+        Row({ "|cff55ff55Posted|r", "|cffffd100" .. p.qty .. "|r", ItemText(id), Coins(p.price),
+          (net >= 0 and "|cff55ff55+|r" or "|cffff5555-|r") .. Coins(math.floor(math.abs(net) * p.qty)) })
+      else
+        msg("|cffff5555Couldn't post " .. ItemText(id) .. ":|r " .. tostring(err))
+        sell.plans[id] = nil
+      end
+      return
+    end
+    searching = { id = id, at = GetTime() }
+    local ok = pcall(C_AuctionHouse.SendSearchQuery, C_AuctionHouse.MakeItemKey(id), SORT, true)
+    L("sell_search", { item = id, ok = ok and 1 or 0 })
+    if not ok then searching = nil end
+  end
+
+  local sfr = CreateFrame("Frame")
+  sfr:RegisterEvent("COMMODITY_SEARCH_RESULTS_UPDATED")
+  sfr:RegisterEvent("AUCTION_HOUSE_SHOW")
+  sfr:RegisterEvent("AUCTION_HOUSE_CLOSED")
+  sfr:SetScript("OnEvent", function(_, e, a1)
+    if e ~= "COMMODITY_SEARCH_RESULTS_UPDATED" then
+      sell.done, sell.plans, searching = {}, {}, nil
+      return
+    end
+    if not (searching and searching.id == a1) then return end
+    if C_AuctionHouse.GetNumCommoditySearchResults(a1) == 0 and not C_AuctionHouse.HasFullCommoditySearchResults(a1) then return end
+    searching = nil
+    local ok, p = pcall(Plan, a1)
+    if not ok then L("error", { what = "sell_plan", err = p }) return end
+    if p.state == "gone" then sell.done[a1] = "held" return end
+    sell.plans[a1] = p
+    L("sell_plan", { item = a1, state = p.state, price = p.price, floor = p.floor, ahead = p.ahead,
+      hours = p.hours and math.floor(p.hours * 10 + 0.5) / 10, why = p.why })
+  end)
+
+  -- Lines for the Sell tab: each sniped item in your bags and what happens to it.
+  function wb_AHSnipe_SellLines()
+    local out = {}
+    for _, it in ipairs(SellList()) do
+      local p, d = sell.plans[it.id], sell.done[it.id]
+      local s
+      if d == "posted" then s = "|cff888888posted|r"
+      elseif d == "held" then s = "|cffff5555held|r"
+      elseif p and p.state == "post" then
+        s = "|cff55ff55" .. Coins(p.price) .. "|r"
+        if p.lowHour then s = s .. " |cff888888(low hour " .. p.lowHour.pct .. "%, best " .. HourText(p.lowHour.best) .. ")|r" end
+      elseif p then s = "|cffff5555" .. (p.why or "hold") .. "|r"
+      else s = "|cff888888paid " .. Coins(math.floor(Cost(it.id))) .. "|r" end
+      out[#out + 1] = ItemText(it.id) .. " |cffaaaaaax" .. it.count .. "|r  " .. s
+      if #out >= 10 then break end
+    end
+    return out
+  end
+end)()
