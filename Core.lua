@@ -66,14 +66,19 @@ end
 -- measured in the chat font and padded with an invisible texture of the exact
 -- missing width.
 local SPACER = "Interface\\AddOns\\wb_AHSnipe\\spacer"
+-- Every money column is right-aligned, so digits line up by coin (copper
+-- under copper) and rows can be compared at a glance.
+--   Bought:  what, qty, item, profit,  profit/h,  session total
+--   Posted:  what, qty, item, price,   profit
+--   Drop:    what,  -,  item, price,   was …,     max …
+--   Failed:  what,  -,  item, then the reason as free text (cells.tail)
 local COLS = {          -- w = pixels (any font), ch = characters (mono font)
-  { w = 62, ch = 7 },                -- what happened
-  { w = 34, ch = 4, right = true },  -- quantity
-  { w = 170, ch = 20, trunc = true },-- item (long names are shortened)
-  { w = 110, ch = 7, right = true }, -- price (999g 99s 99c = 7 digits)
-  { w = 150, ch = 18 },               -- details ("(was …)", "(… each)", why it failed)
-  { w = 120, ch = 15 },               -- your max
-  { w = 0 },                         -- win rate for this item (last column)
+  { w = 62, ch = 7 },                 -- what happened
+  { w = 34, ch = 4, right = true },   -- quantity
+  { w = 170, ch = 20, trunc = true }, -- item (long names are shortened)
+  { w = 80, ch = 8, right = true },   -- profit, or price (+999g99s99c fits)
+  { w = 100, ch = 10, right = true }, -- profit per hour, or "was …"
+  { w = 90, ch = 9, right = true },   -- session total, or "max …"
 }
 
 -- Mono mode: count visible characters and pad with spaces. Exact, because
@@ -130,35 +135,29 @@ local function Truncate(text, w)
   return pre .. (chars[1] or "") .. "…" .. post
 end
 
+-- cells.tail: free text right after the item column, in place of the money
+-- columns (a Failed row's reason). Trailing empty cells print nothing.
 local function Row(cells)
   local out = {}
-  if MonoOn() then
-    for i, col in ipairs(COLS) do
-      local text = tostring(cells[i] or "")
-      if col.ch then
-        if col.trunc then text = TruncateChars(text, col.ch) end
-        local gap = string.rep(" ", math.max(0, col.ch - Visible(text)))
-        local sep = (i >= 4) and "  " or " "
-        out[#out + 1] = col.right and (gap .. text .. sep) or (text .. gap .. sep)
-      else
-        out[#out + 1] = text
-      end
-    end
-    msg(table.concat(out))
-    return
-  end
-  for i, col in ipairs(COLS) do
-    local text = tostring(cells[i] or "")
-    if col.trunc then text = Truncate(text, col.w) end
-    if col.w > 0 then
-      local gap = col.w - Width(text)
-      if col.right then out[#out + 1] = Pad(gap) .. text .. Pad(i == 4 and 24 or 10)
-      else out[#out + 1] = text .. Pad(gap + 10) end
+  local last = cells.tail and 3 or #COLS
+  while last > 3 and (cells[last] == nil or cells[last] == "") do last = last - 1 end
+  local mono = MonoOn()
+  for i = 1, last do
+    local col, text = COLS[i], tostring(cells[i] or "")
+    if mono then
+      if col.trunc then text = TruncateChars(text, col.ch) end
+      local gap = string.rep(" ", math.max(0, col.ch - Visible(text)))
+      local sep = (i >= 3) and "  " or " "
+      out[#out + 1] = col.right and (gap .. text .. sep) or (text .. gap .. sep)
     else
-      out[#out + 1] = text
+      if col.trunc then text = Truncate(text, col.w) end
+      local gap = col.w - Width(text)
+      if col.right then out[#out + 1] = Pad(gap) .. text .. Pad(14)
+      else out[#out + 1] = text .. Pad(gap + 10) end
     end
   end
-  msg(table.concat(out))
+  if cells.tail then out[#out + 1] = cells.tail end
+  msg((table.concat(out):gsub("%s+$", "")))
 end
 
 local function Coins(c)
@@ -181,7 +180,7 @@ local function Dim(t)
   return GREY .. t .. "|r"
 end
 
--- "max 1s 50c" for the last column (or "no max").
+-- "max 150" for a price-drop row (or "no max").
 local function MaxCell(id, dim)
   local cap = id and wb_AHSnipe_CapOf and wb_AHSnipe_CapOf(id)
   local t = cap and ("|cffaaaaaamax|r " .. Coins(cap)) or "|cffaaaaaano max|r"
@@ -331,7 +330,7 @@ end
 
 local function Fail(item, why)
   Tally(item, false)
-  Row({ "|cffff5555Failed|r", "", item and Dim(ItemText(item)) or "", "", GREY .. why .. "|r" })
+  Row({ "|cffff5555Failed|r", "", item and Dim(ItemText(item)) or "", tail = GREY .. why .. "|r" })
 end
 
 -- Log ----------------------------------------------------------------------
@@ -874,22 +873,27 @@ local function GoldText(c)
   c = math.floor(c + 0.5)
   return (c < 0 and "|cffff5555-|r" or "|cff55ff55+|r") .. Coins(math.abs(c))
 end
--- "+8250/h  +41204": the session's rate per hour, then its total so far.
--- At least 5 minutes in the rate, so the first buy doesn't show a wild number.
-local function SessionCell()
-  if sess.profit == 0 then return "" end
-  local rate = sess.profit / math.max(AHTime() / 3600, 1 / 12)
-  return GoldText(rate) .. "|cffaaaaaa/h|r  " .. GoldText(sess.profit)
+-- The session's profit per hour and its total so far, as two cells.
+-- The rate waits for RATE_MIN of AH time: before that, one early buy makes
+-- it swing wildly (one buy in the first minute read as 21g an hour).
+local RATE_MIN = 600
+local function SessionCells()
+  if sess.profit == 0 then return "", "" end
+  local t = AHTime()
+  local rate = t >= RATE_MIN and (GoldText(sess.profit / (t / 3600)) .. "|cffaaaaaa/h|r") or ""
+  return rate, GoldText(sess.profit)
 end
 
--- Returns the profit cell and the session cell for a Bought row.
+-- The profit, rate and total cells for a Bought row. Each buy's profit is
+-- rounded to whole copper before it's added, so the total is exactly the sum
+-- of the rows above it.
 local function BuyProfit(id, qty, total)
   local each = SoldValue(id) or (DB.mkt and DB.mkt[id] and DB.mkt[id].now)
-  if not each or not total then return "|cff888888?|r", SessionCell() end
-  local p = qty * each * (1 - AH_CUT_PCT / 100) - total
+  if not each or not total then return "|cff888888?|r", SessionCells() end
+  local p = math.floor(qty * each * (1 - AH_CUT_PCT / 100) - total + 0.5)
   sess.profit = sess.profit + p
   if session[id] then session[id].profit = (session[id].profit or 0) + p end
-  return GoldText(p), SessionCell()
+  return GoldText(p), SessionCells()
 end
 
 f:SetScript("OnEvent", function(_, e, arg1, arg2)
@@ -921,8 +925,8 @@ f:SetScript("OnEvent", function(_, e, arg1, arg2)
     buying = nil
     if b then
       Tally(b.item, true, b.qty, b.total)
-      local profit, hourly = BuyProfit(b.item, b.qty, b.total)
-      Row({ "|cffffd100Bought|r", "|cffffd100" .. b.qty .. "|r", ItemText(b.item), profit, hourly })
+      local profit, rate, sofar = BuyProfit(b.item, b.qty, b.total)
+      Row({ "|cffffd100Bought|r", "|cffffd100" .. b.qty .. "|r", ItemText(b.item), profit, rate, sofar })
     else
       msg("|cffffd100Bought.|r")
     end
@@ -939,8 +943,8 @@ f:SetScript("OnEvent", function(_, e, arg1, arg2)
   if e == "AUCTION_HOUSE_PURCHASE_COMPLETED" then
     if bidding then
       Tally(bidding.item, true, 1, bidding.price)
-      local profit, hourly = BuyProfit(bidding.item, 1, bidding.price)
-      Row({ "|cffffd100Bought|r", "|cffffd1001|r", ItemText(bidding.item), profit, hourly })
+      local profit, rate, sofar = BuyProfit(bidding.item, 1, bidding.price)
+      Row({ "|cffffd100Bought|r", "|cffffd1001|r", ItemText(bidding.item), profit, rate, sofar })
       bidding = nil
     end
     return
@@ -2165,7 +2169,7 @@ local function SnapFavorites()
         -- Only drops to under your max get a line: those are the ones you can act on.
         local cap = Cap(id)
         if pct < 0 and cap and price <= cap then
-          Row({ tag, "", ItemText(id), Coins(price), "|cffaaaaaa(was|r " .. Coins(old) .. "|cffaaaaaa)|r", MaxCell(id) })
+          Row({ tag, "", ItemText(id), Coins(price), "|cffaaaaaawas|r " .. Coins(old), MaxCell(id) })
         end
         L("fav_move", { item = id, old = old, new = price, pct = math.floor(pct * 1000 + 0.5) / 10 })
       else

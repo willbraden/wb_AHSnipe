@@ -51,6 +51,29 @@ def find_files(wow):
     return out
 
 
+def ask_token(path):
+    """Ask for the token, check its shape, save it. Shown as you paste, since a
+    hidden prompt on Windows takes Ctrl+V as a character instead of pasting."""
+    print("Paste your GitHub token (fine-grained, wb_AHSnipe only, Contents: Read and write),")
+    print("then press Enter. Ctrl+V or right-click paste on Windows; Ctrl+Shift+V in Konsole.")
+    if not sys.stdin or not sys.stdin.isatty():
+        print("(No window to type in, so skipping. Run the updater from the desktop to set it up.)")
+        return False
+    for _ in range(3):
+        try:
+            tok = input("Token: ").strip().strip('"')
+        except EOFError:
+            return False
+        if tok.startswith(("github_pat_", "ghp_")) and len(tok) > 30:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(tok)
+            print(f"Saved to {path}")
+            return True
+        print("That doesn't look like a token (they start with github_pat_). Try again.")
+    return False
+
+
 def git_sha(data):
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
@@ -103,8 +126,11 @@ def main():
     ap.add_argument("--machine", required=True, choices=["deck", "pc"])
     ap.add_argument("--wow", required=True, help="the World of Warcraft/_forever_ folder")
     ap.add_argument("--token-file", default=token_path())
+    ap.add_argument("--ask", action="store_true", help="ask for the token if there isn't one yet, and save it")
     a = ap.parse_args()
 
+    if not os.path.isfile(a.token_file) and a.ask and not ask_token(a.token_file):
+        return 2
     if not os.path.isfile(a.token_file):
         print(f"Not uploaded: no GitHub token in {a.token_file}")
         return 2
@@ -122,6 +148,14 @@ def main():
             # 422 on the ref update: the other machine uploaded at the same moment. Try again on top.
             if e.code == 422 and attempt < 2:
                 time.sleep(2)
+                continue
+            # A bad saved token: ask for a new one and try again.
+            if e.code == 401 and a.ask and attempt < 2:
+                print("GitHub didn't accept the saved token.")
+                os.remove(a.token_file)
+                if not ask_token(a.token_file):
+                    return 2
+                gh = GitHub(open(a.token_file).read().strip())
                 continue
             msg = e.read().decode(errors="replace")[:300]
             print(f"Upload failed: HTTP {e.code} {msg}")

@@ -138,14 +138,15 @@ info "In game, the AH Snipe chat tab will say: Installed: $STAMP"
 
 # --- Upload the Deck's data to GitHub ----------------------------------------
 # tools/upload-data.py (shared with the PC) uploads this Deck's saved data to
-# data/deck/ in the repo, if ~/.config/wb_AHSnipe/github-token exists: a
-# fine-grained token for this repo only, with Contents: Read and write.
+# data/deck/ in the repo. The first run asks for a GitHub token (fine-grained,
+# this repo only, Contents: Read and write) and saves it to
+# ~/.config/wb_AHSnipe/github-token.
 # It never stops the update.
 echo
 if ! command -v python3 >/dev/null; then
   warn "Deck data not uploaded: python3 not found."
 elif [[ -f "$src/tools/upload-data.py" ]]; then
-  if python3 "$src/tools/upload-data.py" --machine deck --wow "$WOW"; then
+  if python3 "$src/tools/upload-data.py" --machine deck --wow "$WOW" --ask; then
     ok "Deck data is on GitHub ($REPO, data/deck/)."
   else
     info "(The addon update itself worked.)"

@@ -10,6 +10,7 @@ Each test loads Core.lua against a stubbed WoW API (test_ui.py):
   test_sell_stacks.py  posting every stack (bags and reagent bag), Posted row with a late bag update
   test_dips.py         the thin-dip record keeps real dips and skips the rest
   test_explore.py      Explore settles on the best Buy %, Explore off uses it
+  test_chat.py         chat table: money columns line up, session total = sum of the rows
 """
 import os, re, subprocess, sys
 
@@ -23,6 +24,7 @@ CHECKS = {
     "test_sell_stacks.py": [r"'q': 7.*'q': 20.*'q': 20.*'q': 11", r"Posted.*58"],
     "test_dips.py": [r"^1 dips"],
     "test_explore.py": [r"Explore off picks: 66"],
+    "test_chat.py": [r"^aligned$", r"^totals add up$", r"Failed\s+\[Item 4304\]\s+beaten to it$"],
 }
 
 failed = 0

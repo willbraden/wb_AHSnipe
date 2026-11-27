@@ -58,9 +58,9 @@ Both machines can upload their saved data to `data/deck/` and `data/pc/` in this
 
 Exit WoW first: the game only writes its saved data when it closes.
 
-Each machine needs a GitHub token: on github.com, Settings > Developer settings > Fine-grained tokens, for this repo only, with **Contents: Read and write**. Save it as:
-- Deck: `~/.config/wb_AHSnipe/github-token` (`mkdir -p ~/.config/wb_AHSnipe && nano ~/.config/wb_AHSnipe/github-token`)
-- PC: `%APPDATA%\wb_AHSnipe\github-token`
+Each machine needs a GitHub token: on github.com, Settings > Developer settings > Fine-grained tokens, for this repo only, with **Contents: Read and write** (one token can serve both). The first upload asks for it and saves it:
+- Deck: run **Update AH Snipe** from Desktop Mode and paste it in the window with Ctrl+Shift+V. Saved to `~/.config/wb_AHSnipe/github-token`.
+- PC: double-click **Upload AH data** and paste it. Saved to `%APPDATA%\wb_AHSnipe\github-token`.
 
 ## Setup
 
