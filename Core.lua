@@ -3361,6 +3361,23 @@ wb_AHSnipe_UpdateSell = UpdateSellPanel
   local SEARCH_TIMEOUT = 5
   local sell = { done = {}, plans = {} } -- done[id] = "posted"/"held" this AH visit
   local searching -- { id, at }
+  local posting   -- { id, at }: waiting for the AH to confirm a post
+  local FOLLOW_TTL = 30 -- once an item is being posted, its later stacks reuse the price this long
+
+  local function Fresh(p)
+    local age = GetTime() - p.at
+    return age < RESULT_TTL or (p.posted and age < FOLLOW_TTL)
+  end
+
+  -- All of an item's stacks are up (or the price went stale): one chat row for the total.
+  local function Finish(id, p)
+    sell.plans[id] = nil
+    if not p.posted then sell.done[id] = "held" return end
+    sell.done[id] = "posted"
+    local net = p.price * (1 - AH_CUT) - p.cost
+    Row({ "|cff55ff55Posted|r", "|cffffd100" .. p.posted .. "|r", ItemText(id), Coins(p.price),
+      (net >= 0 and "|cff55ff55+|r" or "|cffff5555-|r") .. Coins(math.floor(math.abs(net) * p.posted)) })
+  end
 
   local function BagSlot(id)
     local last = math.max(5, NUM_TOTAL_EQUIPPED_BAG_SLOTS or 4)
@@ -3469,8 +3486,21 @@ wb_AHSnipe_UpdateSell = UpdateSellPanel
     end
   end
 
+  -- Print the Posted row for items whose stacks are all up, or whose price
+  -- went stale mid-way. Runs on bag updates and every press, since the bag
+  -- can still show the last stack when the AH confirms it.
+  local function Sweep()
+    for id, p in pairs(sell.plans) do
+      if p.posted and not (posting and posting.id == id) then
+        local n = C_Item.GetItemCount and C_Item.GetItemCount(id) or GetItemCount(id)
+        if n == 0 or not BagSlot(id) or not Fresh(p) then Finish(id, p) end
+      end
+    end
+  end
+
   local function Busy()
     return Queued() or buying or (searching and GetTime() - searching.at < SEARCH_TIMEOUT)
+      or (posting and GetTime() - posting.at < SEARCH_TIMEOUT)
       or not C_AuctionHouse.IsThrottledMessageSystemReady()
   end
 
@@ -3480,9 +3510,13 @@ wb_AHSnipe_UpdateSell = UpdateSellPanel
     if Queued() or buying then return "Waiting for the AH", nil, "wait" end
     local it = NextItem()
     if not it then return "Nothing to sell", "Only items you sniped are offered.", "idle" end
+    if posting and GetTime() - posting.at < SEARCH_TIMEOUT then return "Posting " .. ItemText(posting.id), nil, "wait" end
     local p = sell.plans[it.id]
-    if p and GetTime() - p.at < RESULT_TTL then
-      if p.state == "post" then return "Post " .. p.qty .. " " .. ItemText(it.id) .. " at " .. Coins(p.price), nil, "go" end
+    if p and Fresh(p) then
+      if p.state == "post" then
+        return "Post " .. ItemText(it.id) .. " at " .. Coins(p.price),
+          p.posted and (p.posted .. " up, " .. it.count .. " left") or (it.count .. " in your bags"), "go"
+      end
       return "Skip " .. ItemText(it.id), "Held: " .. (p.why or ""), "stop"
     end
     return "Search " .. ItemText(it.id), it.count .. " in your bags", "idle"
@@ -3490,31 +3524,37 @@ wb_AHSnipe_UpdateSell = UpdateSellPanel
 
   function wb_AHSnipe_SellPress()
     if not AH() then return end
+    Sweep()
     if Busy() then L("sell_press", { step = "busy" }) return end
     local it = NextItem()
     if not it then L("sell_press", { step = "nothing" }) return end
     local id = it.id
     local p = sell.plans[id]
-    if p and GetTime() - p.at < RESULT_TTL then
+    if p and p.posted and not Fresh(p) then Finish(id, p); p = nil end
+    if p and Fresh(p) then
       if p.state ~= "post" then
         sell.done[id] = "held"
         L("sell_hold", { item = id, why = p.why, price = p.price, floor = p.floor })
         return
       end
+      -- One post per stack: the AH only takes the stack at the location, so
+      -- each press posts the next stack (bags and reagent bag) at the same price.
       local bag, slot = BagSlot(id)
-      if not bag then sell.done[id] = "held" return end
+      if not bag then Finish(id, p) return end
       local loc = ItemLocation:CreateFromBagAndSlot(bag, slot)
-      local ok, err = pcall(C_AuctionHouse.PostCommodity, loc, DURATION, p.qty, p.price)
-      L("sell_post", { item = id, qty = p.qty, price = p.price, floor = p.floor, cost = math.floor(p.cost),
-        ahead = p.ahead, hours = p.hours and math.floor(p.hours * 10 + 0.5) / 10, ok = ok and 1 or 0, err = err })
+      local okc, qty = pcall(C_AuctionHouse.GetAvailablePostCount, loc)
+      qty = okc and qty or 0
+      if qty < 1 then Finish(id, p) return end
+      local ok, err = pcall(C_AuctionHouse.PostCommodity, loc, DURATION, qty, p.price)
+      L("sell_post", { item = id, qty = qty, price = p.price, floor = p.floor, cost = math.floor(p.cost),
+        ahead = p.ahead, hours = p.hours and math.floor(p.hours * 10 + 0.5) / 10, ok = ok and 1 or 0, err = err,
+        bag = bag, slot = slot })
       if ok then
-        sell.done[id], sell.plans[id] = "posted", nil
-        local net = p.price * (1 - AH_CUT) - p.cost
-        Row({ "|cff55ff55Posted|r", "|cffffd100" .. p.qty .. "|r", ItemText(id), Coins(p.price),
-          (net >= 0 and "|cff55ff55+|r" or "|cffff5555-|r") .. Coins(math.floor(math.abs(net) * p.qty)) })
+        p.posted = (p.posted or 0) + qty
+        posting = { id = id, at = GetTime() }
       else
         msg("|cffff5555Couldn't post " .. ItemText(id) .. ":|r " .. tostring(err))
-        sell.plans[id] = nil
+        if p.posted then Finish(id, p) else sell.plans[id] = nil end
       end
       return
     end
@@ -3528,8 +3568,20 @@ wb_AHSnipe_UpdateSell = UpdateSellPanel
   sfr:RegisterEvent("COMMODITY_SEARCH_RESULTS_UPDATED")
   sfr:RegisterEvent("AUCTION_HOUSE_SHOW")
   sfr:RegisterEvent("AUCTION_HOUSE_CLOSED")
+  sfr:RegisterEvent("AUCTION_HOUSE_AUCTION_CREATED")
+  sfr:RegisterEvent("BAG_UPDATE_DELAYED")
   sfr:SetScript("OnEvent", function(_, e, a1)
+    if e == "AUCTION_HOUSE_AUCTION_CREATED" then
+      local id = posting and posting.id
+      posting = nil
+      -- Last stack confirmed: print the total.
+      Sweep()
+      return
+    end
+    if e == "BAG_UPDATE_DELAYED" then Sweep() return end
     if e ~= "COMMODITY_SEARCH_RESULTS_UPDATED" then
+      for id, p in pairs(sell.plans) do if p.posted then Finish(id, p) end end
+      posting = nil
       sell.done, sell.plans, searching = {}, {}, nil
       return
     end
@@ -3562,4 +3614,52 @@ wb_AHSnipe_UpdateSell = UpdateSellPanel
     end
     return out
   end
+end)()
+
+-- Thin-dip record ------------------------------------------------------------
+-- A thin dip: a few cheap units, then a price jump of DIP_JUMP or more to a
+-- real wall of DIP_WALL+ units. Buying the cheap units and relisting under the
+-- wall is a "reset". This only records them (DB.dips, kept apart from the log
+-- so it lasts days) to see if resets above your max are worth building.
+-- Nothing here buys. tools/export.py writes them to dips.csv.
+;(function()
+  local DIP_JUMP, DIP_WALL, DIP_KEEP, DIP_SAME = 1.15, 20, 3000, 120
+  local last = {} -- [itemID] = { key, at } so one dip isn't recorded on every search
+
+  local dfr = CreateFrame("Frame")
+  dfr:RegisterEvent("COMMODITY_SEARCH_RESULTS_UPDATED")
+  local function Record(id)
+    if not (DB and id) then return end
+    local tiers, n = {}, C_AuctionHouse.GetNumCommoditySearchResults(id) or 0
+    for i = 1, math.min(n, 12) do
+      local r = C_AuctionHouse.GetCommoditySearchResultInfo(id, i)
+      if r then
+        local q = r.quantity - (r.numOwnerItems or 0)
+        if q > 0 then tiers[#tiers + 1] = { p = r.unitPrice, q = q } end
+      end
+    end
+    -- The first wall: the first tier with DIP_WALL+ units that jumps
+    -- DIP_JUMP or more over the dearest cheap unit before it.
+    local qty, cost, top = 0, 0, 0
+    for k, t in ipairs(tiers) do
+      if k > 1 and t.q >= DIP_WALL and t.p >= top * DIP_JUMP then
+        local key = qty .. "@" .. tiers[1].p .. ">" .. t.p
+        local seen = last[id]
+        if seen and seen.key == key and time() - seen.at < DIP_SAME then return end
+        last[id] = { key = key, at = time() }
+        DB.dips = DB.dips or {}
+        local c = Cap(id)
+        table.insert(DB.dips, { ts = time(), item = id, qty = qty, cost = cost, low = tiers[1].p, top = top,
+          wall = t.p, wallQty = t.q, cap = c, sale = TSMValue("DBRegionSaleAvg", id),
+          fav = IsFav(C_AuctionHouse.MakeItemKey and C_AuctionHouse.MakeItemKey(id)) and 1 or nil })
+        while #DB.dips > DIP_KEEP do table.remove(DB.dips, 1) end
+        return
+      end
+      if t.q >= DIP_WALL and k > 1 then return end -- a wall without a jump: no dip
+      qty, cost, top = qty + t.q, cost + t.p * t.q, math.max(top, t.p)
+      if t.q >= DIP_WALL then return end -- the cheapest tier is itself a wall
+    end
+  end
+  -- A record must never get in the way of buying or selling.
+  dfr:SetScript("OnEvent", function(_, _, id) pcall(Record, id) end)
 end)()

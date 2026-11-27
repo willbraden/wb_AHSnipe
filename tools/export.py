@@ -12,6 +12,9 @@ profit.csv     every AH sale (from TSM's records) matched to what you paid,
                oldest units first, with profit after the AH cut and days held
 profit_items.csv  profit, margin, days to sell and units on hand per item
 profit_daily.csv  realized profit per day
+dips.csv       thin dips (a few cheap units, then a 15%+ jump to a wall of 20+),
+               with the profit from buying them and relisting 1c under the wall
+               (rebuilt from the addon's own dip record each run)
 market.csv     each item's market price over time (at most one sample per item
                per 10 minutes), with the hour of day, for charting by hour
 
@@ -450,3 +453,30 @@ if os.path.exists(TSM_SV):
           f"profit_daily.csv: {len(drows)} days (rebuilt). Realized profit: {gsc(total) if total >= 0 else '-' + gsc(-total)}")
 else:
     print("profit: TSM's saved data not found next to wb_AHSnipe.lua, skipped")
+
+# ---------------------------------------------------------------------- dips
+DIP_COLS = ["date", "time", "hour", "item", "item_id", "favorite", "units", "cost", "cheapest", "dearest",
+            "wall", "wall_units", "jump_pct", "relist_profit", "your_max", "profit_beyond_max", "tsm_sale"]
+dip_rows = []
+dips = db.dips if db else None
+for i in range(1, (len(dips) if dips else 0) + 1):
+    d = tbl(dips[i])
+    ts = datetime.datetime.fromtimestamp(d["ts"])
+    relist = d["wall"] - 1
+    units, cost = d["qty"], d["cost"]
+    profit = units * relist * 0.95 - cost
+    mx = d.get("cap")
+    # What your normal sniping would already make: only the units at or under your max.
+    within = profit if (mx is not None and d["top"] <= mx) else 0
+    dip_rows.append({"date": ts.strftime("%Y-%m-%d"), "time": ts.strftime("%H:%M:%S"), "hour": ts.hour,
+        "item": name(d["item"]), "item_id": d["item"], "favorite": 1 if d.get("fav") else 0,
+        "units": units, "cost": cost, "cheapest": d["low"], "dearest": d["top"], "wall": d["wall"],
+        "wall_units": d["wallQty"], "jump_pct": round(100 * (d["wall"] / d["top"] - 1)),
+        "relist_profit": round(profit), "your_max": mx if mx is not None else "",
+        "profit_beyond_max": round(profit - within), "tsm_sale": d.get("sale") or ""})
+with open(os.path.join(HERE, "dips.csv"), "w", newline="", encoding="utf-8") as fh:
+    w = csv.DictWriter(fh, fieldnames=DIP_COLS)
+    w.writeheader()
+    w.writerows(dip_rows)
+print(f"dips.csv: {len(dip_rows)} thin dips (rebuilt), relist profit {sum(r['relist_profit'] for r in dip_rows) / 10000:.2f}g, "
+      f"beyond your max {sum(r['profit_beyond_max'] for r in dip_rows) / 10000:.2f}g")
