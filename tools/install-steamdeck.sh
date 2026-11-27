@@ -136,6 +136,22 @@ info "${bold}Fully restart WoW${rst} (not just /reload) so it picks up new files
 info "Your max prices and settings are kept."
 info "In game, the AH Snipe chat tab will say: Installed: $STAMP"
 
+# --- Upload the Deck's data to GitHub ----------------------------------------
+# tools/upload-data.py (shared with the PC) uploads this Deck's saved data to
+# data/deck/ in the repo, if ~/.config/wb_AHSnipe/github-token exists: a
+# fine-grained token for this repo only, with Contents: Read and write.
+# It never stops the update.
+echo
+if ! command -v python3 >/dev/null; then
+  warn "Deck data not uploaded: python3 not found."
+elif [[ -f "$src/tools/upload-data.py" ]]; then
+  if python3 "$src/tools/upload-data.py" --machine deck --wow "$WOW"; then
+    ok "Deck data is on GitHub ($REPO, data/deck/)."
+  else
+    info "(The addon update itself worked.)"
+  fi
+fi
+
 # --- One-click updater icon ------------------------------------------------
 # A small launcher that always pulls the newest installer. From Desktop Mode it
 # opens Konsole so you can watch; from Game Mode it runs quietly (Game Mode

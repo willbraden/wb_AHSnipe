@@ -28,8 +28,7 @@ local function Queued() return queuedAt and GetTime() - queuedAt < 3 end
 local buying          -- { at, item, qty } while a confirmed purchase is in flight
 local BUY_TIMEOUT = 4 -- seconds to wait for a purchase result before giving up
 local bidding -- { item, price, at } after a single-item buy
-local jumped, jumpAt, jumpPrice -- item the Snipe key opened from favorites
-local itemResultsAt = 0 -- when the single-item list last arrived
+local jumped, jumpAt -- item the Snipe key opened from favorites, and when
 local OVER_MAX_BACK = 10 -- presses in a row with nothing under max before going back to favorites
 local EMPTY_JUMP_BACK = 3 -- ...or this many after a jump that found nothing under max, not even bait
 local overCount = 0
@@ -330,7 +329,7 @@ function wb_AHSnipe_Stats(all)
     .. "  " .. cell(U, 6, true) .. "  " .. cell(Coins(S), 12, true))
 end
 
-local function Fail(qty, item, why)
+local function Fail(item, why)
   Tally(item, false)
   Row({ "|cffff5555Failed|r", "", item and Dim(ItemText(item)) or "", "", GREY .. why .. "|r" })
 end
@@ -576,8 +575,6 @@ function wb_AHSnipe_Refresh(fromBuy)
   return true
 end
 
--- Buy: single items ------------------------------------------------------
-
 -- Jump to deals from favorites ---------------------------------------------
 
 -- Every favorite at or under its max, best deal (furthest under max) first.
@@ -624,6 +621,8 @@ local function OverMax(itemID)
     return true
   end
 end
+
+-- Buy: single items ------------------------------------------------------
 
 local function BuyItem(frame)
   local key = KeyOf(frame)
@@ -686,7 +685,7 @@ local function BuyCommodity()
       return
     end
     L("purchase_timeout", { item = buying.item, qty = buying.qty, age = ms(now - buying.at) })
-    Fail(buying.qty, buying.item, "no answer")
+    Fail(buying.item, "no answer")
     buying = nil
     staleID = itemID
   end
@@ -705,12 +704,11 @@ local function BuyCommodity()
     end
     if quote.total > quote.maxTotal then
       L("quote_rejected", { item = itemID, qty = quote.qty, total = quote.total, maxTotal = quote.maxTotal, est = quote.est, age = ms(now - quote.at) })
-      local lostQty = quote.qty
       C_AuctionHouse.CancelCommoditiesPurchase()
       quote = nil
       staleID = itemID
       wb_AHSnipe_Refresh(true)
-      Fail(lostQty, itemID, "price moved")
+      Fail(itemID, "price moved")
       return
     end
     if GetMoney() < quote.total then msg("Not enough gold.") L("press", { step = "no_gold" }) quote = nil return end
@@ -731,8 +729,7 @@ local function BuyCommodity()
   end
 
   -- First press: count everything under the max (lowered by the resale gap).
-  local fullCap, nextTier = cap, nil
-  cap, nextTier = GapCap(itemID, cap)
+  cap = GapCap(itemID, cap)
   local qty, total, gold = 0, 0, GetMoney()
   local n = C_AuctionHouse.GetNumCommoditySearchResults(itemID)
   if n == 0 and GetTime() - sentAt < 2 then
@@ -828,14 +825,14 @@ function wb_AHSnipe_Buy()
         local d = deals[1]
         local list = {}
         for k = 1, math.min(6, #deals) do list[k] = deals[k].id .. ":" .. deals[k].price .. "/" .. deals[k].cap end
-        jumped, jumpAt, jumpPrice = d.id, GetTime(), d.price
+        jumped, jumpAt = d.id, GetTime()
         if OpenDeal(d.r) then
           pending, sentAt = true, GetTime()
           L("jump", { item = d.id, price = d.price, cap = d.cap, deals = #deals, all = table.concat(list, " ") })
           if DB.tick ~= false and wb_AHSnipe_PlayTick then wb_AHSnipe_PlayTick(d.id) end
           return
         end
-        jumped, jumpAt, jumpPrice = nil, nil, nil
+        jumped, jumpAt = nil, nil
         L("error", { what = "jump_failed", item = d.id })
       end
     end
@@ -894,10 +891,6 @@ local function BuyProfit(id, qty, total)
   if session[id] then session[id].profit = (session[id].profit or 0) + p end
   return GoldText(p), SessionCell()
 end
-function wb_AHSnipe_SessionRate()
-  local h = AHTime() / 3600
-  return sess.profit, h, sess.profit / math.max(h, 1 / 12)
-end
 
 f:SetScript("OnEvent", function(_, e, arg1, arg2)
   if e == "AUCTION_HOUSE_SHOW" then sess.openAt = sess.openAt or GetTime() end
@@ -920,7 +913,7 @@ f:SetScript("OnEvent", function(_, e, arg1, arg2)
     if quote then quote.total = arg2 end -- arg1 unitPrice, arg2 totalPrice
     return
   elseif e == "COMMODITY_PRICE_UNAVAILABLE" then
-    if quote then Fail(quote.qty, quote.itemID, "sold out") staleID = quote.itemID end
+    if quote then Fail(quote.itemID, "sold out") staleID = quote.itemID end
     quote = nil
     return
   elseif e == "COMMODITY_PURCHASE_SUCCEEDED" then
@@ -938,7 +931,7 @@ f:SetScript("OnEvent", function(_, e, arg1, arg2)
   elseif e == "COMMODITY_PURCHASE_FAILED" then
     local b = buying
     buying = nil
-    Fail(b and b.qty, b and b.item, "beaten to it")
+    Fail(b and b.item, "beaten to it")
     staleID = OpenItemID()
     return
   end
@@ -953,14 +946,14 @@ f:SetScript("OnEvent", function(_, e, arg1, arg2)
     return
   elseif e == "UI_ERROR_MESSAGE" then
     if bidding and GetTime() - bidding.at < 3 then
-      Fail(1, bidding.item, tostring(arg2))
+      Fail(bidding.item, tostring(arg2))
       bidding = nil
     end
     return
   end
 
   if e == "COMMODITY_SEARCH_RESULTS_UPDATED" then staleID = nil end
-  if e == "ITEM_SEARCH_RESULTS_UPDATED" then itemStale = false; itemResultsAt = GetTime() end
+  if e == "ITEM_SEARCH_RESULTS_UPDATED" then itemStale = false end
 
   if e == "AUCTION_HOUSE_CLOSED" then quote, buying, queuedAt, jumped = nil, nil, nil, nil end
   Clear()
@@ -997,7 +990,6 @@ SlashCmdList.WBAHSNIPE = function(input)
     elseif val == "on" then wb_AHSnipeLog.off = nil msg("Logging on.")
     else msg("Log has " .. #wb_AHSnipeLog.rows .. " entries" .. (wb_AHSnipeLog.off and " (logging is off)" or "") .. ". /reload to save it to disk. /snipe log clear | on | off") end
   elseif cmd == "tune" then
-    if val == "apply" then wb_AHSnipe_TuneApplyAll() end
     wb_AHSnipe_TuneWindow()
   elseif cmd == "explore" then
     DB.explore = not DB.explore
@@ -1008,11 +1000,11 @@ SlashCmdList.WBAHSNIPE = function(input)
   elseif cmd == "version" then
     msg("|cffaaaaaaInstalled:|r " .. tostring(wb_AHSnipe_Build or "unknown"))
   elseif cmd == "tab" then
-    DB.ownTab = not (DB.ownTab ~= false)
+    DB.ownTab = DB.ownTab == false
     wb_AHSnipe_SetupTab()
     msg("Own chat tab " .. (DB.ownTab ~= false and "on." or "off. Messages go to your main chat."))
   elseif cmd == "mono" then
-    DB.monoChat = not (DB.monoChat ~= false)
+    DB.monoChat = DB.monoChat == false
     wb_AHSnipe_ApplyMono()
     msg("Monospace chat " .. (DB.monoChat ~= false and "on." or "off."))
   elseif cmd == "profit" then
@@ -1031,8 +1023,9 @@ SlashCmdList.WBAHSNIPE = function(input)
   elseif cmd == "status" then
     msg("AH ready: " .. tostring(C_AuctionHouse.IsThrottledMessageSystemReady()) .. ", waiting on reply: " .. tostring(pending))
   else
-    msg("/snipe max <gold>  (max for the open item, or default if none is open)")
-    msg("/snipe default <gold>  |  /snipe clear  |  /snipe status")
+    msg("/snipe max <gold>  (max for the open item, or the default if none is open)")
+    msg("/snipe default <gold> | clear | stay | explore | tune | stats | profit | market")
+    msg("/snipe log [clear|on|off] | tab | mono | version | status")
     msg("Default max: " .. (DB.default and money(DB.default) or "none"))
   end
 end
@@ -1040,7 +1033,7 @@ end
 -- AH Snipe window -----------------------------------------------------------
 -- One window to the right of the AH, with four tabs:
 --   Snipe: what the next press will do, and the open item's own settings.
---   Sell:  what you paid vs the price you're posting at.
+--   Sell:  one-button selling of what you sniped, and what you paid vs your price.
 --   Setup: defaults, Explore, Check prices and its results.
 --   Buy %: win rates per Buy %.
 -- It follows the AH: the AH's Sell tab shows Sell, going back shows Snipe.
@@ -1096,7 +1089,7 @@ function wb_AHSnipe_Favorites()
     end
   end
   lastBrowse = "fav"
-  jumped, jumpAt, jumpPrice = nil, nil, nil
+  jumped, jumpAt = nil, nil
   return wb_AHSnipe_Refresh(true)
 end
 
@@ -1322,7 +1315,8 @@ local function NextPress()
         Coins(math.floor(quote.total / quote.qty + 0.5)) .. " each, max " .. Coins(cap), "go"
     end
     if staleID == id then return "Refresh", "The list changed after your last buy.", "idle" end
-    local fullCap, nextTier = cap, nil
+    local fullCap = cap
+    local nextTier
     cap, nextTier = GapCap(id, cap)
     local under, afford, cheapest, n = Under(id, cap)
     if n == 0 then return "Loading listings", "", "wait" end
@@ -1411,7 +1405,7 @@ local function Speak(text)
 end
 
 function wb_AHSnipe_PlayTick(itemID)
-  local name, id = wb_AHSnipe_TickSound()
+  local _, id = wb_AHSnipe_TickSound()
   if id == nil then -- Say item
     local text = itemID and (C_Item.GetItemNameByID(itemID) or (wb_AHSnipeLog.names and wb_AHSnipeLog.names[itemID])) or "Buy"
     if Speak(text) then return end
@@ -1457,9 +1451,8 @@ end
 -- The item name's tooltip: what used to fill the card.
 function wb_AHSnipe_ItemDetails(id)
   local out = {}
-  local pct, why = PickPct(id), nil
-  if DB.explore then why = "exploring"
-  else
+  local pct, why = PickPct(id), "exploring"
+  if not DB.explore then
     local _, w = SavedPct(id)
     why = w == "best" and "its best" or w == "item" and "set for it" or "general"
   end
@@ -2161,15 +2154,12 @@ local function SnapFavorites()
     end
   end
 
-  local changed = false
   for id, price in pairs(cur) do
     local old = prevFav and prevFav[id]
     if old and old > 0 and price ~= old then
       local pct = (price - old) / old
       if math.abs(pct) >= FAV_ALERT then
         favChanges[id] = pct
-        changed = true
-        local name = (wb_AHSnipeLog.names[id]) or C_Item.GetItemNameByID(id) or ("item " .. id)
         local n = math.floor(math.abs(pct) * 100 + 0.5)
         local tag = pct < 0 and ("|cff33ff33-" .. n .. "%|r") or ("|cffff5555+" .. n .. "%|r")
         -- Only drops to under your max get a line: those are the ones you can act on.
@@ -2494,6 +2484,7 @@ local function HourText(h)
   if h == 0 then return "12am" elseif h < 12 then return h .. "am" elseif h == 12 then return "12pm" end
   return (h - 12) .. "pm"
 end
+wb_AHSnipe_HourText = HourText -- for the selling section, outside this block
 
 -- usual = the average of each hour's average, so hours you play a lot don't
 -- count extra. Also the cheapest and priciest hours as a % of usual.
@@ -2518,7 +2509,7 @@ end
 
 local MKT_MIN_HOURS = 4 -- hours of data before naming a cheapest hour
 
--- Two short lines for the Snipe tab's item card.
+-- Two short lines for the item name's tooltip.
 function wb_AHSnipe_MarketLines(id)
   local m = wb_AHSnipe_MarketInfo(id)
   if not m or not m.now then return "|cffaaaaaaMarket:|r |cff888888no data yet|r", "" end
@@ -2936,94 +2927,10 @@ tf:SetScript("OnEvent", function(self)
 end)
 
 
--- /snipe tune ------------------------------------------------------------------
--- For each item: win rate and units won per try at each Buy % tested.
--- "Best" = the most units won per try (with at least MIN_TRIES tries), since a
--- small sure win and a big risky one are both worth something.
--- With Explore off each item uses its best automatically.
-
-function wb_AHSnipe_Tune(apply)
-  local tune = DB.tune or {}
-  local ids = {}
-  for id in pairs(tune) do ids[#ids + 1] = id end
-  if #ids == 0 then
-    msg("No Buy % data yet. Turn on |cffffd100Explore|r in the Setup tab and snipe as usual.")
-    return
-  end
-  table.sort(ids, function(a, b)
-    local function n(id) local t = 0 for _, r in pairs(tune[id]) do t = t + r.won + r.lost end return t end
-    return n(a) > n(b)
-  end)
-  local function cell(t, n, right)
-    t = tostring(t or "")
-    local gap = string.rep(" ", math.max(0, n - Visible(t)))
-    return right and (gap .. t) or (t .. gap)
-  end
-  local applied = 0
-  for _, id in ipairs(ids) do
-    local t = tune[id]
-    local best, bestEV, untested = nil, -1, {}
-    local parts = {}
-    for _, p in ipairs(PCTS) do
-      local r = t[p]
-      local n = r and (r.won + r.lost) or 0
-      if n == 0 then
-        untested[#untested + 1] = p .. "%"
-        parts[#parts + 1] = cell("|cff666666" .. p .. "%  -|r", 16)
-      else
-        local win = math.floor(100 * r.won / n + 0.5)
-        local ev = r.units / n
-        if n >= MIN_TRIES and ev > bestEV then best, bestEV = p, ev end
-        local color = win >= 60 and "|cff55ff55" or win >= 30 and "|cffffd100" or "|cffff5555"
-        parts[#parts + 1] = cell(p .. "% " .. color .. win .. "%|r|cffaaaaaa/" .. n .. "|r", 16)
-      end
-    end
-    msg(cell(TruncateChars(ItemText(id), 20), 20) .. " " .. table.concat(parts, ""))
-    local cur = PickPct(id)
-    local line
-    if best then
-      line = ("    best |cffffd100%d%%|r (%.1f units per try)"):format(best, bestEV)
-      if apply then
-        DB.itemPct = DB.itemPct or {}
-        DB.itemPct[id] = best
-        applied = applied + 1
-        line = line .. "  |cff55ff55saved|r"
-      elseif best ~= cur then
-        line = line .. ("  |cffaaaaaa(using %d%%)|r"):format(cur)
-      end
-    else
-      line = "    |cffaaaaaanot enough tries yet (need " .. MIN_TRIES .. " at one Buy %)|r"
-    end
-    if #untested > 0 then line = line .. "  |cffaaaaaatry next: " .. table.concat(untested, ", ") .. "|r" end
-    msg(line)
-  end
-  -- Best hours overall
-  local hours = {}
-  for h, r in pairs(DB.hourly or {}) do
-    local n = r.won + r.lost
-    if n >= 5 then hours[#hours + 1] = { h = h, win = r.won / n, n = n } end
-  end
-  table.sort(hours, function(a, b) return a.win > b.win end)
-  if #hours > 0 then
-    local hs = {}
-    for k = 1, math.min(3, #hours) do
-      local e = hours[k]
-      hs[#hs + 1] = ("%s %d%%"):format(date("%I%p", time({ year = 2000, month = 1, day = 1, hour = e.h })):gsub("^0", ""):lower(), math.floor(e.win * 100 + 0.5))
-    end
-    msg("|cffaaaaaaBest hours so far:|r " .. table.concat(hs, ", "))
-  end
-  if apply then
-    msg(applied > 0 and ("Saved Buy % for " .. applied .. " items.") or "Nothing to save yet.")
-  elseif not DB.explore then
-    msg("|cffaaaaaaExplore is off: each item uses its best, or your general Buy % until it has one.|r")
-  end
-end
-
 
 -- Buy % results window ------------------------------------------------------------
--- The /snipe tune report as a table: each item's win rate and tries at each
--- Buy %, the best one (most units won per try, 4+ tries), what it uses now,
--- and buttons to save the best.
+-- The Buy % tab (/snipe tune): each item's win rate and tries at each Buy %,
+-- the best one (most units won per try, MIN_TRIES+ tries), and what it uses now.
 
 local tuneWin
 
@@ -3050,18 +2957,6 @@ local function TuneData()
 end
 
 local function Using(id) return SavedPct(id) end
-
-function wb_AHSnipe_TuneApplyAll()
-  local n = 0
-  for _, row in ipairs(TuneData()) do
-    if row.best then
-      DB.itemPct = DB.itemPct or {}
-      DB.itemPct[row.id] = row.best
-      n = n + 1
-    end
-  end
-  msg(n > 0 and ("Saved the best Buy % for " .. n .. " items.") or "Not enough tries yet to save anything.")
-end
 
 local PCT_X, BEST_X, USING_X = 176, 480, 540
 
@@ -3572,10 +3467,8 @@ wb_AHSnipe_UpdateSell = UpdateSellPanel
   sfr:RegisterEvent("BAG_UPDATE_DELAYED")
   sfr:SetScript("OnEvent", function(_, e, a1)
     if e == "AUCTION_HOUSE_AUCTION_CREATED" then
-      local id = posting and posting.id
       posting = nil
-      -- Last stack confirmed: print the total.
-      Sweep()
+      Sweep() -- last stack confirmed: print the total
       return
     end
     if e == "BAG_UPDATE_DELAYED" then Sweep() return end
@@ -3606,7 +3499,7 @@ wb_AHSnipe_UpdateSell = UpdateSellPanel
       elseif d == "held" then s = "|cffff5555held|r"
       elseif p and p.state == "post" then
         s = "|cff55ff55" .. Coins(p.price) .. "|r"
-        if p.lowHour then s = s .. " |cff888888(low hour " .. p.lowHour.pct .. "%, best " .. HourText(p.lowHour.best) .. ")|r" end
+        if p.lowHour then s = s .. " |cff888888(low hour " .. p.lowHour.pct .. "%, best " .. wb_AHSnipe_HourText(p.lowHour.best) .. ")|r" end
       elseif p then s = "|cffff5555" .. (p.why or "hold") .. "|r"
       else s = "|cff888888paid " .. Coins(math.floor(Cost(it.id))) .. "|r" end
       out[#out + 1] = ItemText(it.id) .. " |cffaaaaaax" .. it.count .. "|r  " .. s

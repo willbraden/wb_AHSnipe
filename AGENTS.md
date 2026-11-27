@@ -15,7 +15,9 @@ The user prefers concise, plain language and no em dashes, in code comments, cha
 | Keybinds | `Bindings.xml` |
 | Chat padding texture, chat font | `spacer.tga`, `fonts/mono.ttf` (JetBrains Mono, OFL) |
 | Log to CSV export | `tools/export.py` |
+| Tests (stubbed WoW API) | `tests/run_all.py` (`pip install lupa`) |
 | Steam Deck installer and updater | `tools/install-steamdeck.sh` |
+| Upload saved data to GitHub (both machines) | `tools/upload-data.py`, PC launcher `tools/upload-ah-data.bat` |
 
 In a game install, the addon lives in `<WoW folder>/_forever_/Interface/AddOns/wb_AHSnipe/` and the saved data in `_forever_/WTF/Account/<ACCOUNT>/SavedVariables/wb_AHSnipe.lua`, written only on `/reload` or logout. You find the account folder by looking for `SavedVariables/wb_AHSnipe.lua` under `WTF/Account/`; if there is more than one, you ask which. `tools/export.py` writes its CSVs to the folder you run it from.
 
@@ -25,7 +27,7 @@ In a game install, the addon lives in `<WoW folder>/_forever_/Interface/AddOns/w
 2. **You spend gold only on a real key press.** Quotes, confirms and bids run inside the Snipe keybind or a button click. You never buy from a timer, an event or `OnUpdate`. Searches (refresh, favorites, price check) may run from code; purchases may not.
 3. **You never let a buy exceed the max.** A commodity confirm only goes through if the server's quote is at or under `qty × max`. Otherwise you cancel and refresh.
 4. **You keep the chat table aligned.** With the mono font on, you pad by visible characters (`Visible()` strips color codes, including the newer `|cnIQ1:` form, and link markup). You never measure chat text in pixels when mono is on.
-5. **You test before you hand it over.** After every edit you run a syntax check (`load()` the file in Lua, for example with Python's `lupa`), and for chat or layout logic you run the function against sample data. You back up `Core.lua` before editing it in a live install.
+5. **You test before you hand it over.** After every edit you run `python tests/run_all.py`: it loads `Core.lua` against a stubbed WoW API (`tests/test_ui.py`) and checks the window, 2000 random presses (never sends while queued, never confirms over max, no Lua errors), selling, the dip record and Explore. Add a test when you add a feature. `luacheck Core.lua --no-global --no-max-line-length` should show only shadowing warnings. You back up `Core.lua` before editing it in a live install.
 
 ## Features and how they connect
 
@@ -46,7 +48,7 @@ It reads **Max price**, **Min qty** and **Buy %** from the window, feeds **Win t
 One window to the right of the AH, with four tabs. It follows the AH: the AH's Sell tab switches it to **Sell**, going back switches it to **Snipe**. Setup and Buy % are only opened by a click. `wb_AHSnipe_SelectTab(i)` switches tabs and `wb_AHSnipe_Layout()` sizes the window for the tab.
 
 - **Snipe:** the **Next press** line, then the open item's card, kept short on purpose: name, Stay, max, and one line with this session's win rate and expected profit for the item (`SessionSummary()`). Everything else (Buy % in use and why, all-time win rate, market, sold/day, realized profit) is in the tooltip on the item name (`wb_AHSnipe_ItemDetails()`). The Next press detail line only shows for gray (refresh) and red (blocked) states. The window's height follows what's showing (`settings.snipeH`). With no item open, the card is replaced by your favorites under max. **Keep this tab sparse:** new per-item info goes in the name tooltip, not on the card.
-- **Sell:** Bought vs selling.
+- **Sell:** what the next press sells and the sniped items in your bags (see One-button selling), plus Bought vs selling for the item in the AH's sell slot.
 - **Setup:** default max, Min qty, Check %, general Buy % with Explore, Check prices, and the price check results.
 - **Buy %:** win rates per Buy %, the best per item, and the % each item uses now.
 
@@ -78,16 +80,16 @@ Every commodity search checks for a thin dip: a few cheap units (other sellers' 
 One click loads favorites if needed, then searches every favorite in turn from a driver frame, waiting for the AH between searches. For each item it computes **market**: the price reached after the cheapest 10% of units (at least 5), so bait can't drag it down; for single items, the 25th percentile buyout. Suggested max = market × Check %. Results show under the button on the Setup tab (scrolling list, Set per row, Apply all), are logged as `price_check` rows, and set `DB.lastCheckAt`.
 
 ### Sold per day (TSM)
-`SoldPerDay(id)` reads TSM's region sold-per-day (`TSM_API.GetCustomPriceValue("DBRegionSoldPerDay", "i:<id>")`, from the TSM desktop app's AppHelper data). `SlowSeller(id)` blocks buying, jumping and the Next press line when it's under **Min sold/day** (`DB.minSold`, default 200, Setup tab; 0 = off). Items TSM has no number for are not blocked, and nothing breaks if TSM isn't installed. The item card shows the number. When the favorites list loads, `CheckSlowFavorites()` names each favorite under Sold/day (skipped) or with no TSM number once per session, in a single chat line per page load that has new ones. Changing Min sold/day resets it. (Keying on the whole list repeated it, because the favorites page reloads with items coming and going.)
+`SoldPerDay(id)` reads TSM's region sold-per-day (`TSM_API.GetCustomPriceValue("DBRegionSoldPerDay", "i:<id>")`, from the TSM desktop app's AppHelper data). `SlowSeller(id)` blocks buying, jumping and the Next press line when it's under **Min sold/day** (`DB.minSold`, default 200, Setup tab; 0 = off). Items TSM has no number for are not blocked, and nothing breaks if TSM isn't installed. The item name's tooltip shows the number. When the favorites list loads, `CheckSlowFavorites()` names each favorite under Sold/day (skipped) or with no TSM number once per session, in a single chat line per page load that has new ones. Changing Min sold/day resets it. (Keying on the whole list repeated it, because the favorites page reloads with items coming and going.)
 
 ### TSM snapshot (machines without TSM)
 The Steam Deck has no TSM. `Snapshot.lua` stands in: `wb_AHSnipe_Snapshot` holds TSM's region sale average (`sale`) and sold per day (`sold`) for every item, plus the PC's maxes (`caps`, `default`). `SoldValue()` and `SoldPerDay()` ask TSM first and fall back to the snapshot, so the ceiling, Sold/day and the slow-seller notice work everywhere. On a machine without TSM, `ApplySnapshotCaps()` copies the PC's maxes in once per new snapshot (`DB.snapApplied`); maxes changed there afterwards stay until the next snapshot. The PC never applies it (TSM is loaded). **Before every push, you regenerate it on the PC:** `python3 snapshot.py <AddOns>/TradeSkillMaster_AppHelper/AppData.lua <SavedVariables>/wb_AHSnipe.lua <AddOns>/wb_AHSnipe/Snapshot.lua` (the script lives in the user's AH Tracking folder and in `tools/`), then copy `Snapshot.lua` into the repo. It's a new file in the `.toc`, so the first install needs a full game restart.
 
 ### Realized profit (live ledger + TSM history)
-Snipe keeps its own ledger in `DB.ledger` (started the first time it runs, `start`): every won snipe goes in from `Tally()` via `wb_AHSnipe_LedgerBuy`, and every "Auction successful" mail goes in when the mailbox opens (`ScanMail()` on `MAIL_SHOW` / `MAIL_INBOX_UPDATE`, from `GetInboxInvoiceInfo`: sale minus the AH cut, sent time = now minus (30 minus days left), each mail counted once via `seen`). TSM's saved records (`TradeSkillMasterDB["r@<realm>@internalData@csvSales"]` and `csvBuys`; **sale prices are already after the cut**, per unit) fill in what the ledger can't see: everything before `start`, and AH buys made by hand after it (TSM buys that don't match a ledger snipe by item, qty and 2 minutes). `BuildProfit()` matches sales to buys oldest-first. Units with no AH buy (farmed, crafted) don't count. The Snipe tab's item card and the Sell tab show it per item; `/snipe profit` prints the total, the last 7 days and the top items. `tools/export.py` does the TSM-only version offline (`profit.csv`, `profit_items.csv`, `profit_daily.csv`), so it reflects TSM's last save.
+Snipe keeps its own ledger in `DB.ledger` (started the first time it runs, `start`): every won snipe goes in from `Tally()` via `wb_AHSnipe_LedgerBuy`, and every "Auction successful" mail goes in when the mailbox opens (`ScanMail()` on `MAIL_SHOW` / `MAIL_INBOX_UPDATE`, from `GetInboxInvoiceInfo`: sale minus the AH cut, sent time = now minus (30 minus days left), each mail counted once via `seen`). TSM's saved records (`TradeSkillMasterDB["r@<realm>@internalData@csvSales"]` and `csvBuys`; **sale prices are already after the cut**, per unit) fill in what the ledger can't see: everything before `start`, and AH buys made by hand after it (TSM buys that don't match a ledger snipe by item, qty and 2 minutes). `BuildProfit()` matches sales to buys oldest-first. Units with no AH buy (farmed, crafted) don't count. The item name's tooltip and the Sell tab show it per item; `/snipe profit` prints the total, the last 7 days and the top items. `tools/export.py` does the TSM-only version offline (`profit.csv`, `profit_items.csv`, `profit_daily.csv`), so it reflects TSM's last save.
 
 ### Market price by hour
-Whenever an item's listings load (sniping, jumping, price checks), `RecordMarket()` notes its market price (same math as Price check). At most one sample per item per 10 minutes goes into `DB.mkt[id].h[hour]`, so a long session doesn't outweigh the rest of the day; `m.now` always holds the latest. Usual = the average of the hour averages. The Snipe tab's item card shows market now as a % of usual, and after 4 hours of data, the cheapest and priciest hours. `/snipe market` lists every item, cheapest hour first. Each sample is logged as a `market` row and exported to `market.csv`.
+Whenever an item's listings load (sniping, jumping, price checks), `RecordMarket()` notes its market price (same math as Price check). At most one sample per item per 10 minutes goes into `DB.mkt[id].h[hour]`, so a long session doesn't outweigh the rest of the day; `m.now` always holds the latest. Usual = the average of the hour averages. The item name's tooltip shows market now as a % of usual, and after 4 hours of data, the cheapest and priciest hours. `/snipe market` lists every item, cheapest hour first. Each sample is logged as a `market` row and exported to `market.csv`.
 
 ### Stale price reminder
 Every time the AH opens, if `DB.lastCheckAt` is 1+ hour old (or missing), a popup offers Check prices. Until the user answers, the Snipe key won't buy. It exists because the user once bought a lot at stale maxes.
@@ -113,7 +115,10 @@ Every time the AH opens, if `DB.lastCheckAt` is 1+ hour old (or missing), a popu
 - `tools/export.py` turns the log into `purchases.csv`, `deals.csv`, `bait.csv`, `prices.csv` and `winrates.csv`. The `wb-ahsnipe-log-analysis` skill reads the log and these CSVs.
 
 ### Steam Deck
-`tools/install-steamdeck.sh` finds `_forever_`, installs from GitHub `main`, remembers the folder, stamps `Build.lua` with the install time (shown at login and by `/snipe version`), logs to `~/.config/wb_AHSnipe/last-update.log`, and keeps an **Update AH Snipe** launcher on the desktop and in Steam.
+`tools/install-steamdeck.sh` finds `_forever_`, installs from GitHub `main`, remembers the folder, stamps `Build.lua` with the install time (shown at login and by `/snipe version`), logs to `~/.config/wb_AHSnipe/last-update.log`, and keeps an **Update AH Snipe** launcher on the desktop and in Steam. After installing, it runs `tools/upload-data.py --machine deck`.
+
+### Data upload (`tools/upload-data.py`)
+One script for both machines. It finds the newest `WTF/Account/*/SavedVariables/wb_AHSnipe.lua`, plus `TradeSkillMaster.lua`, `TradeSkillMaster_AppHelper.lua` next to it and `Interface/AddOns/TradeSkillMaster_AppHelper/AppData.lua` when they exist (PC only), and commits the changed ones to `data/<machine>/` in one commit through the GitHub Git Data API (blobs, tree, commit, ref; retried if the other machine pushed at the same moment). Unchanged files are skipped by comparing git blob hashes. Token: `~/.config/wb_AHSnipe/github-token` (Linux) or `%APPDATA%\wb_AHSnipe\github-token` (Windows), fine-grained, this repo, Contents read/write. The Deck updater calls it; the PC runs it from `tools/upload-ah-data.bat`. **The repo is public**, so these files are too. With `data/pc/` you can run `tools/snapshot.py data/pc/AppData.lua data/pc/wb_AHSnipe.lua Snapshot.lua` and `tools/export.py` without the PC. `git pull` before reading them: the machines commit to `main`.
 
 ## How the pieces depend on each other
 
@@ -121,7 +126,7 @@ Every time the AH opens, if `DB.lastCheckAt` is 1+ hour old (or missing), a popu
 Window ──(Max, Min qty, Buy %)──▶ Snipe key ──▶ AH requests (rule 1 gate)
   ▲ Next press line mirrors ──────────┘
    ▲                                    │
-   │ Use N% / Apply all                 ├──▶ Chat tab (Row, Fail)
+   │ bests apply automatically          ├──▶ Chat tab (Row, Fail)
    │                                    ├──▶ Tally ──▶ stats, tune, hourly
 Buy % tab ◀── tune ◀────────────────────┘         │
                                                   └──▶ Bought vs selling
@@ -136,8 +141,8 @@ Everything ──▶ L() log ──▶ export.py CSVs ──▶ analysis skill
 
 - **You add a setting:** you store it in `wb_AHSnipeDB`. A per-item setting goes on the Snipe tab's card; a general one goes on Setup. You build it with `BigBox()` or a checkbox, refresh it in `UpdateSnipePage()` or `UpdateSetupPage()` so it always shows the saved value, and mention it in `README.md`.
 - **You add an AH request:** you route it through the same checks as `wb_AHSnipe_Refresh` (rule 1), and you log it with `L()`.
-- **You add a chat line:** you print it with `Row()` so it stays aligned, and you pass a `MaxCell()` and `WinCell()` if it is about an item.
+- **You add a chat line:** you print it with `Row()` so it stays aligned. Keep rows short (the user asked for less on screen); `MaxCell()` is there for lines about prices against a max.
 - **You add a window or panel:** you don't. You add it to one of the window's tabs (or a new tab in `BuildBox()`), and size it in `wb_AHSnipe_Layout()`.
 - **You add a log event:** you document it in the analysis skill's event table, and in `export.py` if a CSV should use it.
-- **You add a top-level `local`:** you remember Lua allows 200 active locals in the file's main chunk. `Core.lua` hit it once; the profit and market sections now sit in a `do ... end` block so their locals don't count. Put new self-contained sections in their own `do` block (expose what others need as `wb_AHSnipe_*` globals), or split into files listed in the `.toc`.
+- **You add a top-level `local`:** you remember Lua allows 200 active locals in the file's main chunk. `Core.lua` hit it once; the profit and market sections now sit in a `do ... end` block so their locals don't count. Put new self-contained sections in their own `do` block, or better `;(function() ... end)()` (locals in a `do` block still count while it runs; a function's don't). Expose what other sections need as `wb_AHSnipe_*` globals: a local from one block is nil in another, which is how the selling section once crashed on `HourText`. Or split into files listed in the `.toc`.
 - **You ship it:** you copy the files to the user's `AddOns/wb_AHSnipe` folder and stamp `Build.lua` with the time and commit (or push to GitHub when they ask, after regenerating `Snapshot.lua`), and you tell them whether `/reload` is enough or a full restart is needed (new files such as fonts or textures need a restart).

@@ -17,12 +17,12 @@ A World of Warcraft: Forever addon for fast auction house sniping with the stock
 - **Favorites mode.** On your favorites list, Snipe opens the best deal (furthest under its max). After 10 presses with nothing under max, it goes back to favorites, or after 3 if the cheap units were already gone when it landed (no deal and no bait). Check **Stay** on the item card (or use the keybind) to camp one item.
 - **Check prices.** One click checks every favorite automatically and suggests a max at your **Check %** of market (default 70%). If it's been an hour since your last check, opening the AH asks you to check first, and Snipe won't buy until you answer.
 - **Explore Buy %.** Tries each Buy % (35 to 85%) 4 times per item, then sticks to the best and tests another only 1 try in 5. With Explore off, each item uses its best automatically (your general Buy % until it has one). The **Buy %** tab shows win rate and tries for each.
-- **Realized profit.** Records your snipes and every sale mail live when you open the mailbox, and uses TSM's records for history and buys you made by hand. Each sale is matched to what you paid (oldest units first, after the AH cut). The Snipe and Sell tabs show profit, margin and days to sell per item; `/snipe profit` shows your total, the last 7 days and your best items. The CSV export writes `profit.csv`, `profit_items.csv` and `profit_daily.csv`.
+- **Realized profit.** Records your snipes and every sale mail live when you open the mailbox, and uses TSM's records for history and buys you made by hand. Each sale is matched to what you paid (oldest units first, after the AH cut). Hover an item's name on the Snipe tab (or see the Sell tab) for its profit, margin and days to sell; `/snipe profit` shows your total, the last 7 days and your best items. The CSV export writes `profit.csv`, `profit_items.csv` and `profit_daily.csv`.
 - **TSM buy ceiling.** Never pays more than **Max % TSM** (default 90%) of what buyers actually paid across the region (TSM's sale average). Items without their own max use it as their max, so new favorites work right away.
 - **Resale gap.** Only buys units at least **Resale gap %** (default 20%) under the next price tier above your max, about where you'd relist them.
 - **Works without TSM (Steam Deck).** Each update carries a snapshot of TSM's sale averages and sold per day, plus your PC's max prices, so the buy ceiling and Sold/day work on a machine without TSM. Your PC's maxes are copied in once per new snapshot.
 - **Sold per day (TSM).** If you use TSM with its desktop app, Snipe skips items that sell fewer than **Sold/day** across the region (default 200, Setup tab, 0 turns it off). Items TSM has no number for aren't blocked.
-- **Market price by hour.** Every time an item's listings load, its market price is noted by hour of day (at most every 10 minutes per item). The Snipe tab shows the market now as a % of usual and, once it has 4 hours of data, the cheapest and priciest hours. `/snipe market` lists every item; the CSV export adds `market.csv` for charts.
+- **Market price by hour.** Every time an item's listings load, its market price is noted by hour of day (at most every 10 minutes per item). Hover an item's name on the Snipe tab for the market now as a % of usual and, once it has 4 hours of data, the cheapest and priciest hours. `/snipe market` lists every item; the CSV export adds `market.csv` for charts.
 - **One-button selling.** On the AH's Sell tab, or with the Sell tab picked in the Snipe window, the Snipe key sells what you sniped (there's also a separate Sell keybind): one press searches the item, then each press posts one of its stacks at that price. The price skips tiny bait listings, aims to sell within about 3 hours (from TSM sold/day), and never goes under what you paid plus 5% after the cut and deposit. Under that, the item is held and the next press moves on.
 - **Bought vs selling.** On the AH's Sell tab, shows what you paid for that item (this session and all-time average), the price you're posting at after the 5% AH cut, and your profit per unit and in total.
 - **Green prices** in the native AH lists for anything at or under your max, plus `-32%` / `+40%` badges on favorites that moved 25% or more between refreshes and a `no max` tag on favorites without a max.
@@ -49,12 +49,25 @@ curl -fsSL https://raw.githubusercontent.com/willbraden/wb_AHSnipe/main/tools/in
 
 It finds your `World of Warcraft/_forever_` folder (Steam Proton prefix, SD card, Heroic or Lutris), downloads the latest version and installs it. It remembers the folder and adds an **Update AH Snipe** icon to your desktop: double-click it to update, or right-click it > Add to Steam to update from Game Mode (it runs without a window there). Each update stamps the install time; the AH Snipe chat tab shows "Installed: <time>" at login (or `/snipe version`), and the full output is in `~/.config/wb_AHSnipe/last-update.log`. If it can't find WoW, pass the folder: `bash install-steamdeck.sh "/path/to/World of Warcraft/_forever_"`.
 
+### Uploading your data to GitHub (optional)
+
+Both machines can upload their saved data to `data/deck/` and `data/pc/` in this repo, so it can be analyzed (and the Deck's snapshot rebuilt) even when the PC is off. **This repo is public, so those files are too.** One script does it on both: `tools/upload-data.py`. It sends only files that changed, in one commit.
+
+- **Deck:** the updater runs it after each update. It uploads Snipe's saved data.
+- **PC:** double-click **Upload AH data** (`tools/upload-ah-data.bat`, needs Python 3 from the Microsoft Store). It uploads Snipe's saved data, TSM's saved data and TSM's region prices (`AppData.lua`).
+
+Exit WoW first: the game only writes its saved data when it closes.
+
+Each machine needs a GitHub token: on github.com, Settings > Developer settings > Fine-grained tokens, for this repo only, with **Contents: Read and write**. Save it as:
+- Deck: `~/.config/wb_AHSnipe/github-token` (`mkdir -p ~/.config/wb_AHSnipe && nano ~/.config/wb_AHSnipe/github-token`)
+- PC: `%APPDATA%\wb_AHSnipe\github-token`
+
 ## Setup
 
 1. In Keybindings, under **wb_AH Snipe**, bind:
    - **Snipe (one button: refresh, quote, buy)**
    - **Refresh favorites**
-   - Optional: **Refresh AH**, **Check prices**, **Toggle Stay on the open item**
+   - Optional: **Sell next sniped item** (sells from any AH tab), **Refresh AH**, **Check prices**, **Toggle Stay on the open item**
 2. Open the AH. In the AH Snipe window to the right, set a default max on the **Setup** tab, or click into an item and set its own max on the **Snipe** tab.
 3. Spam the Snipe key.
 
@@ -65,6 +78,7 @@ Macros, if you prefer:
 /run wb_AHSnipe_Refresh()
 /run wb_AHSnipe_Favorites()
 /run wb_AHSnipe_Check()
+/run wb_AHSnipe_SellPress()   -- sell the next sniped item
 /run wb_AHSnipe_ToggleRoam()   -- toggles Stay on the open item
 ```
 
@@ -75,6 +89,9 @@ Macros, if you prefer:
 | `/snipe max <gold>` | Max for the open item, or your default if none is open |
 | `/snipe default <gold>` | Default max for items without their own |
 | `/snipe clear` | Remove the open item's max |
+| `/snipe stay` | Stay on the open item (or stop staying) |
+| `/snipe profit` | Realized profit: total, last 7 days, best items |
+| `/snipe market` | Each item's market now vs usual, and its cheapest and priciest hours |
 | `/snipe tune` | Open the Buy % tab |
 | `/snipe explore` | Turn Explore Buy % on or off |
 | `/snipe version` | Show when this copy was installed |
@@ -98,6 +115,10 @@ python tools/export.py "<path to>/wb_AHSnipe.lua"
 - `deals.csv`: favorites dips at or under your max, and whether you bought
 - `bait.csv`: bait listings seen, with the next real price
 - `prices.csv`: Check prices results
+- `winrates.csv`: win rate by item, Buy %, hour and weekday
+- `market.csv`: each item's market price over time
+- `profit.csv`, `profit_items.csv`, `profit_daily.csv`: realized profit from TSM's records (needs `TradeSkillMaster.lua` next to `wb_AHSnipe.lua`)
+- `dips.csv`: thin dips (a few cheap units, then a 15%+ jump to a wall), with the profit from buying and relisting them
 
 Running it again only adds new rows.
 
